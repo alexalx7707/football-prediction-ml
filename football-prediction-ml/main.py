@@ -4,122 +4,113 @@ import os
 import pandas as pd
 import numpy as np
 import kagglehub
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
+from xgboost import XGBClassifier
 import seaborn as sns
 import joblib
 import warnings
-warnings.filterwarnings('ignore')  # Ignora avertismentele - nu vrem negativitate!
+warnings.filterwarnings('ignore')
 
-# 📥 Descarcă datele din Kaggle - la fel ca un gol de zile mari!
+# ──────────────────────────────────────────────
+# 📥 DESCĂRCARE DATE
+# ──────────────────────────────────────────────
+
 print("Descarcă datele meciurilor de fotbal din Kaggle...")
 path = kagglehub.dataset_download("adamgbor/club-football-match-data-2000-2025")
 print(f"Datele au sosit în: {path}")
 
-# 📂 Afișează ce fișiere sunt în pachet - să vedem ce am primit!
 data_files = os.listdir(path)
 print(f"\nFișiere disponibile: {data_files}")
 
-# 🏆 Încarcă doar meciurile (nu ratinguri Elo plictisitoare)
 matches_path = os.path.join(path, 'Matches.csv')
 if os.path.exists(matches_path):
     df = pd.read_csv(matches_path)
     print(f"\n✅ Încarcă fișierul: Matches.csv")
 else:
-    # 🤔 Planul B: caută orice fișier CSV (optimism!)  
     csv_files = [f for f in data_files if f.endswith('.csv')]
     if csv_files:
         df = pd.read_csv(os.path.join(path, csv_files[0]))
         print(f"\n✅ Am încărcat: {csv_files[0]}")
     else:
-        raise FileNotFoundError("Nici un fișier CSV! Unde e datele, dom'le?!")
+        raise FileNotFoundError("Nici un fișier CSV!")
 
-print(f"Dimensiuni dataset: {df.shape}  # (rânduri, coloane)")
-print(f"\nPrimele rânduri (ca să vedem cu ce muncim):")
+print(f"Dimensiuni dataset: {df.shape}")
 print(df.head())
-print(f"\nNumele coloanelor (ca să stim cine e cine):")
-print(df.columns.tolist())
-print(f"\nTipurile de date (numerele și textele lor):")
-print(df.dtypes)
-print(f"\nValori lipsă (gauri în date):")
-print(df.isnull().sum())
 
-# 🔧 Pregătim datele - ca o echipă înainte de meci!
+# ──────────────────────────────────────────────
+# 🔧 PRELUCRAREA DATELOR
+# ──────────────────────────────────────────────
+
 print("\n" + "="*50)
 print("PRELUCRAREA DATELOR")
 print("="*50)
 
-# 📋 Facem o copie (nu vrem sa distrugem originalele!)
 df_model = df.copy()
 
-# ⏰ Convertim datele în format de dată (să fie mai ușor de tras cu ele)
-if 'MatchDate' in df_model.columns:
-    df_model['MatchDate'] = pd.to_datetime(df_model['MatchDate'], errors='coerce')
-    df_model['Year'] = df_model['MatchDate'].dt.year  # Extragem anul
+# Parse date
+df_model['MatchDate'] = pd.to_datetime(df_model['MatchDate'], errors='coerce')
+df_model = df_model.dropna(subset=['MatchDate'])
+df_model = df_model.sort_values('MatchDate').reset_index(drop=True)
 
-# 🗑️ Ștergem rândurile goale (meciuri fără echipe? Imposibil!)
+# Derivăm sezonul (sezonul începe în iulie pentru ligile care încep devreme)
+def get_season(date):
+    if pd.isna(date):
+        return np.nan
+    if date.month >= 7:
+        return f"{date.year}/{str(date.year + 1)[-2:]}"
+    else:
+        return f"{date.year - 1}/{str(date.year)[-2:]}"
+
+df_model['Season'] = df_model['MatchDate'].apply(get_season)
+df_model['Year']   = df_model['MatchDate'].dt.year
+df_model = df_model.dropna(subset=['Season'])
+
+# Ștergem rândurile fără echipe sau rezultat
 df_model = df_model.dropna(subset=['HomeTeam', 'AwayTeam', 'FTResult'])
 
-# 🏟️ Traducem rezultatul meciurilor în numere (H=1 acasă, D=0 egal, A=-1 deplasare)
+# Codificăm rezultatul
 def map_result(result):
-    """Transformă rezultatele în numere - ca la fotbal, dar mai simplu!"""
-    if result == 'H':  # Acasă a câștigat!
-        return 1
-    elif result == 'D':  # Egal - frumos dar nu décis
-        return 0
-    elif result == 'A':  # Deplasare a câștigat - aia e!
-        return -1
-    else:
-        return np.nan
+    if result == 'H':  return 1
+    elif result == 'D': return 0
+    elif result == 'A': return -1
+    else: return np.nan
 
-df_model['Result'] = df_model['FTResult'].apply(map_result)  # Aplicăm pe toate rândurile
-df_model = df_model.dropna(subset=['Result'])  # Și ștergem ce nu avem rezultat
+df_model['Result'] = df_model['FTResult'].apply(map_result)
+df_model = df_model.dropna(subset=['Result'])
 
-print(f"\n📊 Distribuția rezultatelor (cine a câștigat mai mult):")
+print(f"\n📊 Distribuția rezultatelor:")
 print(df_model['Result'].value_counts())
+print(f"\n📅 Sezoane disponibile: {sorted(df_model['Season'].unique())}")
 
-# ⚙️ Inginerie de caracteristici - adunăm ingredientele pentru rețeta noastră!
-print("\n🔨 Pregătim ingredientele...")
+# ──────────────────────────────────────────────
+# ⚙️ INGINERIE DE CARACTERISTICI
+# ──────────────────────────────────────────────
 
-# 📈 Selectăm care caracteristici vor intra în model - alegem ce e important
-feature_columns = ['HomeElo', 'AwayElo']  # Începem cu ratingurile Elo
+print("\n🔨 Pregătim caracteristicile...")
 
-# 💪 Adunăm forma echipelor (cum au jucat recent)
-form_features = ['Form3Home', 'Form5Home', 'Form3Away', 'Form5Away']
-for feat in form_features:
-    if feat in df_model.columns:
-        feature_columns.append(feat)  # Dacă e disponibil, îl luăm!
+feature_columns = ['HomeElo', 'AwayElo']
 
-# ⚽ Adunăm statisticile de atac (șuturi, colțuri - dur cu mingea!)
+form_features      = ['Form3Home', 'Form5Home', 'Form3Away', 'Form5Away']
 attacking_features = ['HomeShots', 'AwayShots', 'HomeTarget', 'AwayTarget', 'HomeCorners', 'AwayCorners']
-for feat in attacking_features:
+discipline_features= ['HomeFouls', 'AwayFouls', 'HomeYellow', 'AwayYellow', 'HomeRed', 'AwayRed']
+
+for feat in form_features + attacking_features + discipline_features:
     if feat in df_model.columns:
         feature_columns.append(feat)
 
-# 🟨 Adunăm datele disciplinei (cărți galbene, roșii - cine e neaștâmpărat?)
-discipline_features = ['HomeFouls', 'AwayFouls', 'HomeYellow', 'AwayYellow', 'HomeRed', 'AwayRed']
-for feat in discipline_features:
-    if feat in df_model.columns:
-        feature_columns.append(feat)
-
-# 📅 Adunăm și anul (pentru a vedea dacă meciurile evoluează)
 if 'Year' in df_model.columns:
     feature_columns.append('Year')
 
-# 🧪 Creăm noi caracteristici din cele existente (alchimie de date!)
-print("✨ Creăm caracteristici derivate (combinații inteligente)...")
-
-# 📊 Diferența de Elo (cine e mai puternic?)
+# Caracteristici derivate
 if 'HomeElo' in df_model.columns and 'AwayElo' in df_model.columns:
-    df_model['EloDifference'] = df_model['HomeElo'] - df_model['AwayElo']  # Cine are avantaj
-    df_model['EloTotal'] = df_model['HomeElo'] + df_model['AwayElo']  # Calitatea meciurilor
+    df_model['EloDifference'] = df_model['HomeElo'] - df_model['AwayElo']
+    df_model['EloTotal']      = df_model['HomeElo'] + df_model['AwayElo']
     feature_columns.extend(['EloDifference', 'EloTotal'])
 
-# 📈 Diferența de formă (cine a jucat mai bine recent?)
 if 'Form3Home' in df_model.columns and 'Form3Away' in df_model.columns:
     df_model['Form3Diff'] = df_model['Form3Home'] - df_model['Form3Away']
     feature_columns.append('Form3Diff')
@@ -128,17 +119,14 @@ if 'Form5Home' in df_model.columns and 'Form5Away' in df_model.columns:
     df_model['Form5Diff'] = df_model['Form5Home'] - df_model['Form5Away']
     feature_columns.append('Form5Diff')
 
-# ⚽ Diferența de șuturi (cine a tras mai mult?)
 if 'HomeShots' in df_model.columns and 'AwayShots' in df_model.columns:
     df_model['ShotsDifference'] = df_model['HomeShots'] - df_model['AwayShots']
     feature_columns.append('ShotsDifference')
 
-# 🚩 Diferența de colțuri (cine a avut mai multe ocazii?)
 if 'HomeCorners' in df_model.columns and 'AwayCorners' in df_model.columns:
     df_model['CornersDifference'] = df_model['HomeCorners'] - df_model['AwayCorners']
     feature_columns.append('CornersDifference')
 
-# 🟨 Puncte pentru cărți (galbene = 1, roșii = 2 - cine e mai nervos?)
 if 'HomeYellow' in df_model.columns and 'HomeRed' in df_model.columns:
     df_model['CardPointsHome'] = df_model['HomeYellow'] + 2 * df_model['HomeRed']
     feature_columns.append('CardPointsHome')
@@ -147,126 +135,338 @@ if 'AwayYellow' in df_model.columns and 'AwayRed' in df_model.columns:
     df_model['CardPointsAway'] = df_model['AwayYellow'] + 2 * df_model['AwayRed']
     feature_columns.append('CardPointsAway')
 
-# 0️⃣ Umplim valorile lipsă cu 0 (joacă sigur și pune zerouri!)
+# Umplere valori lipsă
 for col in feature_columns:
     if col in df_model.columns:
         df_model[col] = df_model[col].fillna(0)
 
-# 🧹 Ștergem rândurile cu valori lipsă (trebuie date curate!)
-X = df_model[feature_columns].dropna()  # Caracteristicile (ingredientele)
-y = df_model.loc[X.index, 'Result']  # Ținta (ce vrem să ghicim)
+print(f"\n✅ Caracteristici selectate ({len(feature_columns)}): {feature_columns}")
 
-print(f"\n✅ Am selectat {len(feature_columns)} caracteristici: ")
-print(f"   {feature_columns}")
-print(f"💾 Dimensiuni: {X.shape[0]} meciuri, {X.shape[1]} caracteristici")
-print(f"🏟️ Rezultate: {y.shape[0]} meciuri pentru învățat")
 
-# ✂️ Împărțim datele: 80% pentru antrenament, 20% pentru test (ca la antrenament!)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-print(f"\n📚 Set de antrenament: {X_train.shape[0]} meciuri (să învețe modelul)")
-print(f"🧪 Set de test: {X_test.shape[0]} meciuri (să verificăm că nu a furat răspunsurile!)")
+# ──────────────────────────────────────────────
+# 📈 ROLLING FEATURES (adaugă după sort_values('MatchDate'))
+# ──────────────────────────────────────────────
 
-# 🤖 Antrenarea modelelor - e ca profesorul să învețe elevii!
+print("\n🔄 Calculez rolling features...")
+
+# Puncte câștigate per meci (3 = victorie, 1 = egal, 0 = înfrângere)
+def match_points_home(result):
+    if result == 'H': return 3
+    elif result == 'D': return 1
+    else: return 0
+
+def match_points_away(result):
+    if result == 'A': return 3
+    elif result == 'D': return 1
+    else: return 0
+
+df_model['PointsHome'] = df_model['FTResult'].apply(match_points_home)
+df_model['PointsAway'] = df_model['FTResult'].apply(match_points_away)
+
+# ── Construim istoricul per echipă ──
+# Pentru fiecare meci, calculăm statistici din ultimele N meciuri ale echipei
+# .shift(1) e critic — se asigură că nu folosim datele din meciul curent (data leakage!)
+
+for window in [5, 10]:
+    # --- Goluri marcate (media) ---
+    # Acasă
+    df_model[f'Home_GoalsScored_Last{window}'] = (
+        df_model.groupby('HomeTeam')['FTHome']
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    )
+    # Deplasare
+    df_model[f'Away_GoalsScored_Last{window}'] = (
+        df_model.groupby('AwayTeam')['FTAway']
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    )
+
+    # --- Goluri primite (media) ---
+    df_model[f'Home_GoalsConceded_Last{window}'] = (
+        df_model.groupby('HomeTeam')['FTAway']
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    )
+    df_model[f'Away_GoalsConceded_Last{window}'] = (
+        df_model.groupby('AwayTeam')['FTHome']
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    )
+
+    # --- Puncte câștigate (forma) ---
+    df_model[f'Home_Points_Last{window}'] = (
+        df_model.groupby('HomeTeam')['PointsHome']
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    )
+    df_model[f'Away_Points_Last{window}'] = (
+        df_model.groupby('AwayTeam')['PointsAway']
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    )
+
+# --- Diferențe între echipe (cine e în formă mai bună?) ---
+for window in [5, 10]:
+    df_model[f'GoalsScored_Diff_Last{window}'] = (
+        df_model[f'Home_GoalsScored_Last{window}'] - df_model[f'Away_GoalsScored_Last{window}']
+    )
+    df_model[f'GoalsConceded_Diff_Last{window}'] = (
+        df_model[f'Home_GoalsConceded_Last{window}'] - df_model[f'Away_GoalsConceded_Last{window}']
+    )
+    df_model[f'Points_Diff_Last{window}'] = (
+        df_model[f'Home_Points_Last{window}'] - df_model[f'Away_Points_Last{window}']
+    )
+
+# Adaugă toate rolling features în lista de caracteristici
+rolling_feature_cols = [col for col in df_model.columns if 'Last5' in col or 'Last10' in col]
+for col in rolling_feature_cols:
+    df_model[col] = df_model[col].fillna(0)
+    if col not in feature_columns:
+        feature_columns.append(col)
+
+print(f"✅ Adăugate {len(rolling_feature_cols)} rolling features: {rolling_feature_cols}")
+
+
+# ──────────────────────────────────────────────
+# ✂️ SPLIT CRONOLOGIC PE SEZON
+# ──────────────────────────────────────────────
+
+print("\n" + "="*50)
+print("SPLIT TRAIN / TEST PE SEZON")
+print("="*50)
+
+TEST_SEASON = "2024/25"
+
+train_df = df_model[df_model['Season'] != TEST_SEASON].copy()
+test_df  = df_model[df_model['Season'] == TEST_SEASON].copy()
+
+# Verificăm că avem date pentru sezonul de test
+if len(test_df) == 0:
+    raise ValueError(f"Nu există meciuri pentru sezonul {TEST_SEASON}! Verifică datele.")
+
+X_train = train_df[feature_columns].fillna(0)
+y_train = train_df['Result']
+X_test  = test_df[feature_columns].fillna(0)
+y_test  = test_df['Result']
+
+all_seasons = sorted(train_df['Season'].unique())
+print(f"\n📚 Antrenament: {all_seasons[0]} → {all_seasons[-1]}  ({len(X_train)} meciuri)")
+print(f"🧪 Test:        {TEST_SEASON}  ({len(X_test)} meciuri)")
+
+# ──────────────────────────────────────────────
+# 🤖 ANTRENAREA MODELELOR
+# ──────────────────────────────────────────────
+
 print("\n" + "="*50)
 print("ANTRENAREA MODELELOR")
 print("="*50)
 
-# 🌲 Random Forest - pădure de copaci de decizie (nu, nu e pentru lemne!)
-print("\n🌲 Antrenez pădurea aleatorie (100 copaci de gânduri)...")
+print("\n🌲 Antrenez Random Forest...")
 rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-rf_model.fit(X_train, y_train)  # Învață din meciuri!
-print("   ✅ Pădurea e antrenată!")
+rf_model.fit(X_train, y_train)
+print("   ✅ Random Forest antrenat!")
 
-# 📖 Regresie Logistică - geometria simplă (cu dreapta o rezolvi pe toată?)
-print("\n📖 Antrenez regresie logistică (mai simplă, dar încă deșteaptă)...")
+print("\n📖 Antrenez Regresia Logistică...")
 lr_model = LogisticRegression(max_iter=1000, random_state=42)
-lr_model.fit(X_train, y_train)  # Și asta învață!
-print("   ✅ Regresie antrenată!")
+lr_model.fit(X_train, y_train)
+print("   ✅ Regresia Logistică antrenată!")
 
-# 📊 Evaluarea modelelor - cum îi merge copiilor noștri de IA?
+# XGBoost needs labels as 0, 1, 2 — not -1, 0, 1
+le = LabelEncoder()
+y_train_enc = le.fit_transform(y_train)
+
+print("\n⚡ Antrenez XGBoost...")
+xgb_model = XGBClassifier(
+    n_estimators=300,
+    max_depth=5,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    eval_metric='mlogloss',
+    random_state=42,
+    n_jobs=2  # keeping it cool
+)
+xgb_model.fit(X_train, y_train_enc)
+print("   ✅ XGBoost antrenat!")
+
+# ──────────────────────────────────────────────
+# 🔍 BACKTESTING MECI CU MECI PE 2024/25
+# ──────────────────────────────────────────────
+
 print("\n" + "="*50)
-print("TESTAREA MODELELOR")
+print(f"BACKTESTING MECI CU MECI — SEZON {TEST_SEASON}")
+print("="*50)
+print("\nModelul face predicții folosind statisticile REALE ale fiecărui meci")
+print("(Elo, formă, șuturi, cornere etc. din acel meci — fără scor)\n")
+
+result_map = {1: "H", 0: "D", -1: "A"}
+label_map  = {1: "Acasă", 0: "Egal", -1: "Deplasare"}
+
+records = []
+
+for idx, row in test_df.iterrows():
+    features      = X_test.loc[idx].values.reshape(1, -1)
+    actual        = int(row['Result'])
+
+    pred_rf       = int(rf_model.predict(features)[0])
+    proba_rf      = rf_model.predict_proba(features)[0]
+    pred_lr       = int(lr_model.predict(features)[0])
+
+    correct_rf    = (pred_rf == actual)
+    correct_lr    = (pred_lr == actual)
+
+    pred_xgb_enc = int(xgb_model.predict(features)[0])
+    pred_xgb = int(le.inverse_transform([pred_xgb_enc])[0])
+    correct_xgb = (pred_xgb == actual)
+
+    records.append({
+        'Date':         row['MatchDate'].strftime('%Y-%m-%d'),
+        'Season':       row['Season'],
+        'HomeTeam':     row['HomeTeam'],
+        'AwayTeam':     row['AwayTeam'],
+        'Score':        f"{int(row['FTHome'])}–{int(row['FTAway'])}",
+        'Actual':       label_map[actual],
+        'RF_Pred':      label_map[pred_rf],
+        'RF_Correct':   '✅' if correct_rf else '❌',
+        'LR_Pred':      label_map[pred_lr],
+        'LR_Correct':   '✅' if correct_lr else '❌',
+        'RF_Conf':      f"{max(proba_rf)*100:.1f}%",
+        'actual_int':   actual,
+        'rf_pred_int':  pred_rf,
+        'lr_pred_int':  pred_lr,
+        'XGB_Pred': label_map[pred_xgb],
+        'XGB_Correct': '✅' if correct_xgb else '❌',
+        'xgb_pred_int': pred_xgb,
+    })
+
+results_df = pd.DataFrame(records)
+
+# Afișăm primele 20 meciuri ca preview
+print(results_df[['Date','HomeTeam','AwayTeam','Score','Actual',
+                   'RF_Pred','RF_Correct','LR_Pred','LR_Correct']].head(20).to_string(index=False))
+print(f"\n... și încă {max(0, len(results_df)-20)} meciuri (toate salvate în CSV)")
+
+# ──────────────────────────────────────────────
+# 📊 METRICI FINALE
+# ──────────────────────────────────────────────
+
+print("\n" + "="*50)
+print(f"REZULTATE FINALE — {TEST_SEASON}")
 print("="*50)
 
-# 🌲 Ce spune pădurea despre testele noi?
-y_pred_rf = rf_model.predict(X_test)
-print("\n🌲 Rezultate RANDOM FOREST (pădurea):")
-acc_rf = accuracy_score(y_test, y_pred_rf)
-prec_rf = precision_score(y_test, y_pred_rf, average='weighted', zero_division=0)
-rec_rf = recall_score(y_test, y_pred_rf, average='weighted', zero_division=0)
-f1_rf = f1_score(y_test, y_pred_rf, average='weighted', zero_division=0)
-print(f"   Acuratețe: {acc_rf:.4f}  (de câte ori are dreptate - 0 = prost, 1 = geniu)")
-print(f"   Precizie: {prec_rf:.4f}  (când spune ceva, câtde adevărat e?)")
-print(f"   Sensibilitate: {rec_rf:.4f}  (vede el toate matchurile importante?)")
-print(f"   F1-Score: {f1_rf:.4f}  (balanța perfectă!)")
+y_actual  = results_df['actual_int']
+y_pred_rf = results_df['rf_pred_int']
+y_pred_lr = results_df['lr_pred_int']
 
-# 📖 Ce zice linia noastră geometrică?
-y_pred_lr = lr_model.predict(X_test)
-print("\n📖 Rezultate REGRESIE LOGISTICĂ (linia dreaptă):")
-acc_lr = accuracy_score(y_test, y_pred_lr)
-prec_lr = precision_score(y_test, y_pred_lr, average='weighted', zero_division=0)
-rec_lr = recall_score(y_test, y_pred_lr, average='weighted', zero_division=0)
-f1_lr = f1_score(y_test, y_pred_lr, average='weighted', zero_division=0)
-print(f"   Acuratețe: {acc_lr:.4f}  (mai simplu, dar funcționează?)")
-print(f"   Precizie: {prec_lr:.4f}  (când dă cu piciorul în poartă?)")
-print(f"   Sensibilitate: {rec_lr:.4f}  (nu ratează ce e important?)")
-print(f"   F1-Score: {f1_lr:.4f}  (cât de bine balanseaza?)")
+acc_rf  = accuracy_score(y_actual, y_pred_rf)
+acc_lr  = accuracy_score(y_actual, y_pred_lr)
+prec_rf = precision_score(y_actual, y_pred_rf, average='weighted', zero_division=0)
+rec_rf  = recall_score(y_actual, y_pred_rf,    average='weighted', zero_division=0)
+f1_rf   = f1_score(y_actual, y_pred_rf,        average='weighted', zero_division=0)
+prec_lr = precision_score(y_actual, y_pred_lr, average='weighted', zero_division=0)
+rec_lr  = recall_score(y_actual, y_pred_lr,    average='weighted', zero_division=0)
+f1_lr   = f1_score(y_actual, y_pred_lr,        average='weighted', zero_division=0)
 
-# 💾 Salvez modelele - ca să nu pierd munca!
+total   = len(results_df)
+rf_correct = results_df['RF_Correct'].str.contains('✅').sum()
+lr_correct = results_df['LR_Correct'].str.contains('✅').sum()
+
+y_pred_xgb = results_df['xgb_pred_int']
+acc_xgb  = accuracy_score(y_actual, y_pred_xgb)
+prec_xgb = precision_score(y_actual, y_pred_xgb, average='weighted', zero_division=0)
+rec_xgb  = recall_score(y_actual, y_pred_xgb,    average='weighted', zero_division=0)
+f1_xgb   = f1_score(y_actual, y_pred_xgb,        average='weighted', zero_division=0)
+xgb_correct = results_df['XGB_Correct'].str.contains('✅').sum()
+
+print(f"\n🌲 RANDOM FOREST")
+print(f"   Meciuri corecte: {rf_correct} / {total}")
+print(f"   Acuratețe:       {acc_rf*100:.2f}%")
+print(f"   Precizie:        {prec_rf*100:.2f}%")
+print(f"   Sensibilitate:   {rec_rf*100:.2f}%")
+print(f"   F1-Score:        {f1_rf*100:.2f}%")
+
+print(f"\n📖 REGRESIE LOGISTICĂ")
+print(f"   Meciuri corecte: {lr_correct} / {total}")
+print(f"   Acuratețe:       {acc_lr*100:.2f}%")
+print(f"   Precizie:        {prec_lr*100:.2f}%")
+print(f"   Sensibilitate:   {rec_lr*100:.2f}%")
+print(f"   F1-Score:        {f1_lr*100:.2f}%")
+
+print(f"\n⚡ XGBOOST")
+print(f"   Meciuri corecte: {xgb_correct} / {total}")
+print(f"   Acuratețe:       {acc_xgb*100:.2f}%")
+print(f"   Precizie:        {prec_xgb*100:.2f}%")
+print(f"   Sensibilitate:   {rec_xgb*100:.2f}%")
+print(f"   F1-Score:        {f1_xgb*100:.2f}%")
+
+# Acuratețe per tip de rezultat
+print(f"\n📈 ACURATEȚE PER TIP DE REZULTAT (Random Forest):")
+for result_val, label in [(-1, 'Deplasare'), (0, 'Egal'), (1, 'Acasă')]:
+    mask     = y_actual == result_val
+    if mask.sum() == 0:
+        continue
+    correct  = ((y_actual == result_val) & (y_pred_rf == result_val)).sum()
+    total_r  = mask.sum()
+    print(f"   {label:<12}: {correct}/{total_r}  ({correct/total_r*100:.1f}%)")
+
+# ──────────────────────────────────────────────
+# 💾 SALVARE
+# ──────────────────────────────────────────────
+
 print("\n" + "="*50)
-print("SALVEZ MODELELE (BACKUP TIME!)")
+print("SALVARE")
 print("="*50)
 
-os.makedirs('models', exist_ok=True)  # Creaza folder dacă nu există
-joblib.dump(rf_model, 'models/random_forest_model.pkl')  # Pădurea în fiola
-joblib.dump(lr_model, 'models/logistic_regression_model.pkl')  # Linia în fiola
-joblib.dump(feature_columns, 'models/feature_columns.pkl')  # Ingredientele în fiola
+os.makedirs('models', exist_ok=True)
+joblib.dump(rf_model,       'models/random_forest_model.pkl')
+joblib.dump(lr_model,       'models/logistic_regression_model.pkl')
+joblib.dump(feature_columns,'models/feature_columns.pkl')
+joblib.dump(xgb_model, 'models/xgb_model.pkl')
+joblib.dump(le,        'models/label_encoder.pkl')
+print("✅ Modele salvate în models/")
 
-print("✅ Pădurea salvată în models/random_forest_model.pkl")
-print("✅ Linia geometrică salvată în models/logistic_regression_model.pkl")
-print("✅ Ingredientele salvate (ca să nu uităm ce am folosit!)")
+# CSV cu toate predicțiile pentru sezonul de test
+results_df.drop(columns=['actual_int','rf_pred_int','lr_pred_int']) \
+          .to_csv('models/backtest_2024_25.csv', index=False)
+print("✅ Predicții meci cu meci salvate în models/backtest_2024_25.csv")
 
-# 📊 Desenez grafice - imagini cu rezultatele (femeile/bărbații iubesc graficele!)
-print("\n📈 Creez grafice frumoase...")
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+# ──────────────────────────────────────────────
+# 📊 GRAFICE
+# ──────────────────────────────────────────────
 
-# 🔄 Matricile de confuzie (cine s-a încurcat cu cine?)
+print("\n📈 Creez grafice...")
 from sklearn.metrics import ConfusionMatrixDisplay
-ConfusionMatrixDisplay.from_predictions(y_test, y_pred_rf, ax=axes[0])
-axes[0].set_title("Pădurea: Cine a ghicit bine/greșit?")
 
-ConfusionMatrixDisplay.from_predictions(y_test, y_pred_lr, ax=axes[1])
-axes[1].set_title("Linia: Cine a ghicit bine/greșit?")
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+ConfusionMatrixDisplay.from_predictions(y_actual, y_pred_rf, ax=axes[0],
+    display_labels=['Deplasare','Egal','Acasă'])
+axes[0].set_title(f"Random Forest — {TEST_SEASON} ({acc_rf*100:.1f}% acuratețe)")
+
+ConfusionMatrixDisplay.from_predictions(y_actual, y_pred_lr, ax=axes[1],
+    display_labels=['Deplasare','Egal','Acasă'])
+axes[1].set_title(f"Regresie Logistică — {TEST_SEASON} ({acc_lr*100:.1f}% acuratețe)")
 
 plt.tight_layout()
 plt.savefig('models/confusion_matrices.png', dpi=100)
-print("✅ Matricile de confuzie salvate în models/confusion_matrices.png")
+print("✅ Matrice de confuzie salvată în models/confusion_matrices.png")
 plt.close()
 
-# 🏆 Importanța caracteristicilor (care ingrediente sunt cu adevărat importanți?)
-fig, ax = plt.subplots(figsize=(10, 6))
-importances = rf_model.feature_importances_  # Ce cred pădurea că e important
-indices = np.argsort(importances)[::-1]  # Sortez de la mai important la mai puțin
+# Importanța caracteristicilor
+fig, ax = plt.subplots(figsize=(12, 6))
+importances = rf_model.feature_importances_
+indices     = np.argsort(importances)[::-1]
 ax.bar(range(len(importances)), importances[indices])
-ax.set_xlabel("Ce caracteristică?")
-ax.set_ylabel("Cât de important (ponderea)?")
-ax.set_title("Pădurea zice: Ce conteaza VRAIMENT?")
 ax.set_xticks(range(len(importances)))
-ax.set_xticklabels(feature_columns, rotation=45, ha='right')  # Rotesc labels ca să se citească
+ax.set_xticklabels([feature_columns[i] for i in indices], rotation=45, ha='right')
+ax.set_title("Importanța caracteristicilor (Random Forest)")
+ax.set_ylabel("Importanță")
 plt.tight_layout()
 plt.savefig('models/feature_importance.png', dpi=100)
 print("✅ Importanța caracteristicilor salvată în models/feature_importance.png")
 plt.close()
 
 print("\n" + "="*50)
-print("🎉 PROIECTUL E GATA! 🎉")
+print("🎉 GATA!")
 print("="*50)
-print("\n✨ Modelele sunt antrenate și salvate!")
-print(f"   Am folosit {len(feature_columns)} caracteristici inteligente")
-print(f"   Pădurea are acuratețe: {acc_rf*100:.2f}%  (cam de câte ori ghicește bine)")
-print(f"   Linia are acuratețe: {acc_lr*100:.2f}%  (mai simplă, dar merge!)")
-print("\n🚀 Acum poți face predicții!")
-print("   Rulează: python predict_match.py \"Manchester United\" \"Liverpool\"")
-print("   Și te va spune cine câștigă! (sau nu... nu e adesea sigur în fotbal 😄)")
+print(f"\n   Antrenat pe:  {all_seasons[0]} → {all_seasons[-1]}")
+print(f"   Testat pe:    {TEST_SEASON}  ({total} meciuri)")
+print(f"\n   🌲 Random Forest:       {acc_rf*100:.2f}% acuratețe  ({rf_correct}/{total} corecte)")
+print(f"   📖 Regresie Logistică:  {acc_lr*100:.2f}% acuratețe  ({lr_correct}/{total} corecte)")
+print(f"\n   Predicții detaliate: models/backtest_2024_25.csv")
 print("="*50)
