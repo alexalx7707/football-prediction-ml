@@ -1,0 +1,14 @@
+Defaulting to user installation because normal site-packages is not writeable
+Collecting uvicorn
+  Downloading uvicorn-0.42.0-py3-none-any.whl.metadata (6.7 kB)
+Collecting click>=7.0 (from uvicorn)
+  Downloading click-8.3.1-py3-none-any.whl.metadata (2.6 kB)
+Collecting h11>=0.8 (from uvicorn)
+  Downloading h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+Requirement already satisfied: colorama in c:\users\alex\appdata\roaming\python\python314\site-packages (from click>=7.0->uvicorn) (0.4.6)
+Downloading uvicorn-0.42.0-py3-none-any.whl (68 kB)
+Downloading click-8.3.1-py3-none-any.whl (108 kB)
+Downloading h11-0.16.0-py3-none-any.whl (37 kB)
+Installing collected packages: h11, click, uvicorn
+
+Successfully installed click-8.3.1 h11-0.16.0 uvicorn-0.42.0
