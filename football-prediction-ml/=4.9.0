@@ -1,0 +1,11 @@
+Defaulting to user installation because normal site-packages is not writeable
+Collecting pymongo
+  Downloading pymongo-4.16.0-cp314-cp314-win_amd64.whl.metadata (10.0 kB)
+Collecting dnspython<3.0.0,>=2.6.1 (from pymongo)
+  Downloading dnspython-2.8.0-py3-none-any.whl.metadata (5.7 kB)
+Downloading pymongo-4.16.0-cp314-cp314-win_amd64.whl (1.0 MB)
+   ---------------------------------------- 1.0/1.0 MB 5.9 MB/s  0:00:00
+Downloading dnspython-2.8.0-py3-none-any.whl (331 kB)
+Installing collected packages: dnspython, pymongo
+
+Successfully installed dnspython-2.8.0 pymongo-4.16.0

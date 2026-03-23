@@ -1,0 +1,8 @@
+Defaulting to user installation because normal site-packages is not writeable
+Collecting xgboost
+  Using cached xgboost-3.2.0-py3-none-win_amd64.whl.metadata (2.1 kB)
+Requirement already satisfied: numpy in c:\users\alex\appdata\roaming\python\python314\site-packages (from xgboost) (2.4.3)
+Requirement already satisfied: scipy in c:\users\alex\appdata\roaming\python\python314\site-packages (from xgboost) (1.17.1)
+Using cached xgboost-3.2.0-py3-none-win_amd64.whl (101.7 MB)
+Installing collected packages: xgboost
+Successfully installed xgboost-3.2.0

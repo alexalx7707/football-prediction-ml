@@ -1,0 +1,18 @@
+Defaulting to user installation because normal site-packages is not writeable
+Collecting scikit-learn
+  Downloading scikit_learn-1.8.0-cp314-cp314-win_amd64.whl.metadata (11 kB)
+Requirement already satisfied: numpy>=1.24.1 in c:\users\alex\appdata\roaming\python\python314\site-packages (from scikit-learn) (2.4.3)
+Collecting scipy>=1.10.0 (from scikit-learn)
+  Using cached scipy-1.17.1-cp314-cp314-win_amd64.whl.metadata (60 kB)
+Collecting joblib>=1.3.0 (from scikit-learn)
+  Downloading joblib-1.5.3-py3-none-any.whl.metadata (5.5 kB)
+Collecting threadpoolctl>=3.2.0 (from scikit-learn)
+  Using cached threadpoolctl-3.6.0-py3-none-any.whl.metadata (13 kB)
+Downloading scikit_learn-1.8.0-cp314-cp314-win_amd64.whl (8.1 MB)
+   ---------------------------------------- 8.1/8.1 MB 6.7 MB/s  0:00:01
+Downloading joblib-1.5.3-py3-none-any.whl (309 kB)
+Using cached scipy-1.17.1-cp314-cp314-win_amd64.whl (37.3 MB)
+Using cached threadpoolctl-3.6.0-py3-none-any.whl (18 kB)
+Installing collected packages: threadpoolctl, scipy, joblib, scikit-learn
+
+Successfully installed joblib-1.5.3 scikit-learn-1.8.0 scipy-1.17.1 threadpoolctl-3.6.0
