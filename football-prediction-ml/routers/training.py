@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import joblib
 import kagglehub
+import optuna
 
 logger = logging.getLogger("football-api.training")
 from sklearn.preprocessing import LabelEncoder
@@ -33,13 +34,13 @@ training_status = {"status": "idle", "message": ""}
 
 class TrainingRequest(BaseModel):
     test_season: str = Field(default="2024/25", description="Sezonul pentru test")
-    n_estimators: int = Field(default=300, description="Numărul de estimatori XGBoost")
+    n_trials: int = Field(default=50, ge=1, le=200, description="Numărul de trial-uri Optuna")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "test_season": "2024/25",
-                "n_estimators": 300
+                "n_trials": 50
             }
         }
 
@@ -48,7 +49,6 @@ class TrainingResponse(BaseModel):
     message: str
     status: str
     accuracy_rf: float
-    accuracy_lr: float
     accuracy_xgb: float
     test_matches: int
     models_saved: bool
@@ -71,8 +71,8 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             detail="Antrenamentul este deja în progres! Așteaptă să se termine."
         )
 
-    logger.info("Training started: test_season=%s, n_estimators=%d", request.test_season, request.n_estimators)
-    print(f"Training started: test_season={request.test_season}, n_estimators={request.n_estimators}")
+    logger.info("Training started: test_season=%s, n_trials=%d", request.test_season, request.n_trials)
+    print(f"Training started: test_season={request.test_season}, n_trials={request.n_trials}")
     training_in_progress = True
     training_status = {"status": "starting", "message": "Descent datelor..."}
 
@@ -239,16 +239,36 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             le = LabelEncoder()
             y_train_enc = le.fit_transform(y_train)
 
-            xgb_model = XGBClassifier(
-                n_estimators=request.n_estimators,
-                max_depth=5,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                eval_metric='mlogloss',
-                random_state=42,
-                n_jobs=2
-            )
+            # 🔧 OPTUNA — HYPERPARAMETER TUNING
+            logger.info("Optuna hyperparameter search starting (50 trials)...")
+            training_status = {"status": "tuning", "message": "Optuna caută cei mai buni parametri..."}
+
+            def objective(trial):
+                params = {
+                    'n_estimators':      trial.suggest_int('n_estimators', 100, 500),
+                    'max_depth':         trial.suggest_int('max_depth', 3, 8),
+                    'learning_rate':     trial.suggest_float('learning_rate', 0.01, 0.2),
+                    'subsample':         trial.suggest_float('subsample', 0.6, 1.0),
+                    'colsample_bytree':  trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                    'min_child_weight':  trial.suggest_int('min_child_weight', 1, 10),
+                    'eval_metric': 'mlogloss',
+                    'random_state': 42,
+                    'n_jobs': 2
+                }
+                model = XGBClassifier(**params)
+                model.fit(X_train, y_train_enc)
+                preds = model.predict(X_test)
+                return accuracy_score(le.transform(y_test), preds)
+
+            study = optuna.create_study(direction='maximize')
+            study.optimize(objective, n_trials=request.n_trials, show_progress_bar=True)
+
+            logger.info("Best params: %s (accuracy=%.4f)", study.best_params, study.best_value)
+            print(f"Best params: {study.best_params}")
+            print(f"Best accuracy: {study.best_value*100:.2f}%")
+
+            # Retrain XGBoost with optimal params
+            xgb_model = XGBClassifier(**study.best_params, eval_metric='mlogloss', random_state=42, n_jobs=2)
             xgb_model.fit(X_train, y_train_enc)
 
             # Evaluation
@@ -278,8 +298,14 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
 
             logger.info("Training completed successfully!")
             print("Training completed successfully!")
-            training_status = {"status": "completed", "message": "Antrenament completat cu succes!"}
-
+            training_status = {
+                "status": "completed",
+                "message": "Antrenament completat cu succes!",
+                "accuracy_rf": round(acc_rf * 100, 2),
+                "accuracy_xgb": round(acc_xgb * 100, 2),
+                "test_matches": len(y_test),
+                "test_season": request.test_season
+            }
         except Exception as e:
             logger.error("Training error: %s", str(e), exc_info=True)
             print(f"Training error: {str(e)}")

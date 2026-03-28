@@ -57,10 +57,11 @@ def load_models():
     try:
         rf_model = joblib.load('models/random_forest_model.pkl')
         xgb_model = joblib.load('models/xgb_model.pkl')
+        le = joblib.load('models/label_encoder.pkl')
         feature_columns = joblib.load('models/feature_columns.pkl')
-        return rf_model, xgb_model, feature_columns
+        return rf_model, xgb_model, le, feature_columns
     except Exception:
-        return None, None, None
+        return None, None, None, None
 
 
 def get_team_elo(team_name, elo_df=None, matches_df=None, is_home=True):
@@ -163,7 +164,7 @@ async def predict_match(request: PredictionRequest):
     try:
         logger.info("Prediction request: %s vs %s", request.home_team, request.away_team)
         print(f"Prediction request: {request.home_team} vs {request.away_team}")
-        rf_model, xgb_model, feature_columns = load_models()
+        rf_model, xgb_model, le, feature_columns = load_models()
 
         if rf_model is None or feature_columns is None:
             logger.warning("Models not loaded - returning 503")
@@ -205,8 +206,16 @@ async def predict_match(request: PredictionRequest):
 
         logger.info("Running prediction (HomeElo=%.1f, AwayElo=%.1f)", home_elo, away_elo)
         print(f"Running prediction (HomeElo={home_elo:.1f}, AwayElo={away_elo:.1f})")
-        prediction = rf_model.predict(features)[0]
-        probabilities = rf_model.predict_proba(features)[0]
+        # XGBoost prediction (Optuna-optimized)
+        xgb_pred_enc = xgb_model.predict(features)[0]
+        prediction = le.inverse_transform([xgb_pred_enc])[0]  # decode back to -1, 0, 1
+
+        xgb_proba = xgb_model.predict_proba(features)[0]
+        # Map encoded class indices back to original labels
+        prob_dict = {}
+        for i, cls_enc in enumerate(xgb_model.classes_):
+            original_label = le.inverse_transform([cls_enc])[0]
+            prob_dict[str(int(original_label))] = xgb_proba[i] * 100
 
         result_map = {
             1.0:  "🏠 Câștigă ACASĂ",
@@ -214,23 +223,20 @@ async def predict_match(request: PredictionRequest):
             -1.0: "🚗 Câștigă DEPLASARE"
         }
 
-        classes = list(rf_model.classes_)
-        prob_dict = {str(int(classes[i])): probabilities[i] * 100 for i in range(len(classes))}
-
         home_win_prob = prob_dict.get("1", 0)
         draw_prob = prob_dict.get("0", 0)
         away_win_prob = prob_dict.get("-1", 0)
 
         logger.info("Prediction result: %s -> %s (confidence: %.1f%%)",
                     f"{request.home_team} vs {request.away_team}",
-                    result_map.get(prediction, "???"), max(probabilities) * 100)
+                    result_map.get(prediction, "???"), max(xgb_proba) * 100)
         print(f"Prediction result: {request.home_team} vs {request.away_team} -> "
-              f"{result_map.get(prediction, '???')} (confidence: {max(probabilities) * 100:.1f}%)")
+              f"{result_map.get(prediction, '???')} (confidence: {max(xgb_proba) * 100:.1f}%)")
 
         return {
             "match": f"{request.home_team} vs {request.away_team}",
             "prediction": result_map.get(prediction, "❓ ???"),
-            "confidence": max(probabilities) * 100,
+            "confidence": max(xgb_proba) * 100,
             "home_team": request.home_team,
             "away_team": request.away_team,
             "home_elo": round(home_elo, 2),
