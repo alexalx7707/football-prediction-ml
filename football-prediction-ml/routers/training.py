@@ -17,7 +17,9 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, log_loss
+from sklearn.metrics import accuracy_score, classification_report, log_loss
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.frozen import FrozenEstimator
 from xgboost import XGBClassifier
 import warnings
 warnings.filterwarnings('ignore')
@@ -158,14 +160,14 @@ def tune_logistic_regression(X_tune, y_tune, X_val, y_val, n_trials):
 
 class TrainingRequest(BaseModel):
     test_season: str = Field(default="2024/25", description="Sezonul pentru test")
-    n_trials: int = Field(default=50, ge=1, le=200, description="Numărul de trial-uri Optuna pentru XGBoost (RF folosește n_trials // 2, LR până la 30)")
+    n_trials: int = Field(default=100, ge=1, le=400, description="Buget Optuna pentru XGBoost (RF folosește n_trials // 2, LR până la 30). Default ridicat la 100 acum că RF/LR au studii proprii.")
     tune_all_models: bool = Field(default=True, description="Dacă false, RF și LR folosesc parametri default (rapid). Dacă true, toate trei modelele sunt tunate cu Optuna.")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "test_season": "2024/25",
-                "n_trials": 50,
+                "n_trials": 100,
                 "tune_all_models": True
             }
         }
@@ -543,27 +545,26 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             logger.info("Tuning subsample: %d rows", len(X_tune))
             print(f"Tuning subsample: {len(X_tune)} rows")
 
-            # Combined train+val frame for final refits after tuning
-            X_full_train = pd.concat([X_train, X_val])
-            y_full_train = pd.concat([y_train, y_val])
+            # Phase C: val is the calibration holdout — keep it separate from training data.
+            # Base models fit on train only; calibrators fit on val; test stays untouched.
 
             # Training
             logger.info("Training models...")
             print("Training models...")
             training_status = {"status": "training", "message": "Antrenez modelele..."}
 
-            # --- Label encoding for XGBoost (fit on full train+val so it sees all classes) ---
+            # --- Label encoding for XGBoost (fit on train; val has same class set) ---
             le = LabelEncoder()
-            le.fit(y_full_train)
+            le.fit(y_train)
             y_tune_enc = le.transform(y_tune)
             y_val_enc = le.transform(y_val)
-            y_full_train_enc = le.transform(y_full_train)
+            y_train_enc = le.transform(y_train)
 
             from sklearn.utils.class_weight import compute_sample_weight
             sample_weights_tune = compute_sample_weight('balanced', y_tune_enc)
-            sample_weights_full = compute_sample_weight('balanced', y_full_train_enc)
+            sample_weights_train = compute_sample_weight('balanced', y_train_enc)
 
-            # --- RandomForest: Optuna on subsample / val, then refit on train+val ---
+            # --- RandomForest: Optuna on subsample/val, fit on train, isotonic calibration on val ---
             if request.tune_all_models:
                 rf_trials = max(10, request.n_trials // 2)
                 logger.info("Optuna RF search starting (%d trials)...", rf_trials)
@@ -572,18 +573,26 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 rf_best_params, rf_best_score = tune_random_forest(X_tune, y_tune, X_val, y_val, rf_trials)
                 logger.info("RF best params: %s (val neg_log_loss=%.4f)", rf_best_params, rf_best_score)
                 print(f"RF best params: {rf_best_params}, val neg_log_loss={rf_best_score:.4f}")
-                rf_model = RandomForestClassifier(
+                rf_base = RandomForestClassifier(
                     **rf_best_params, class_weight='balanced', random_state=42, n_jobs=-1
                 )
             else:
-                rf_model = RandomForestClassifier(
+                rf_base = RandomForestClassifier(
                     n_estimators=100, random_state=42, n_jobs=-1, class_weight='balanced'
                 )
-            logger.info("Refitting RF on full train+val (%d rows)...", len(X_full_train))
-            print(f"Refitting RF on full train+val ({len(X_full_train)} rows)...")
-            rf_model.fit(X_full_train, y_full_train)
+            logger.info("Fitting RF base on train (%d rows)...", len(X_train))
+            print(f"Fitting RF base on train ({len(X_train)} rows)...")
+            rf_base.fit(X_train, y_train)
+            # Isotonic calibration (handles tree-model overconfidence well)
+            # FrozenEstimator preserves the base fit; CalibratedClassifierCV averages 5 calibrators
+            # over folds of val (replaces deprecated cv='prefit' in sklearn >=1.6).
+            logger.info("Calibrating RF on val (%d rows, isotonic)...", len(X_val))
+            print(f"Calibrating RF on val ({len(X_val)} rows, isotonic)...")
+            training_status = {"status": "calibrating_rf", "message": "Calibrare RF (isotonic) pe val..."}
+            rf_model = CalibratedClassifierCV(FrozenEstimator(rf_base), method='isotonic', cv=5)
+            rf_model.fit(X_val, y_val)
 
-            # --- LogisticRegression: Optuna on subsample / val, then refit on train+val ---
+            # --- LogisticRegression: Optuna on subsample/val, fit on train, sigmoid (Platt) on val ---
             if request.tune_all_models:
                 lr_trials = max(10, min(30, request.n_trials))
                 logger.info("Optuna LR search starting (%d trials)...", lr_trials)
@@ -600,12 +609,18 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 lr_inner = LogisticRegression(
                     max_iter=1000, random_state=42, class_weight='balanced'
                 )
-            lr_model = Pipeline([('scaler', StandardScaler()), ('lr', lr_inner)])
-            logger.info("Refitting LR on full train+val (%d rows)...", len(X_full_train))
-            print(f"Refitting LR on full train+val ({len(X_full_train)} rows)...")
-            lr_model.fit(X_full_train, y_full_train)
+            lr_base = Pipeline([('scaler', StandardScaler()), ('lr', lr_inner)])
+            logger.info("Fitting LR base on train (%d rows)...", len(X_train))
+            print(f"Fitting LR base on train ({len(X_train)} rows)...")
+            lr_base.fit(X_train, y_train)
+            # Platt scaling (sigmoid) — appropriate for already-near-linear LR outputs
+            logger.info("Calibrating LR on val (%d rows, sigmoid)...", len(X_val))
+            print(f"Calibrating LR on val ({len(X_val)} rows, sigmoid)...")
+            training_status = {"status": "calibrating_lr", "message": "Calibrare LR (sigmoid) pe val..."}
+            lr_model = CalibratedClassifierCV(FrozenEstimator(lr_base), method='sigmoid', cv=5)
+            lr_model.fit(X_val, y_val)
 
-            # --- XGBoost: Optuna on subsample / val, then refit on train+val ---
+            # --- XGBoost: Optuna on subsample/val, fit base on train, isotonic calibration on val ---
             logger.info("Optuna XGB search starting (%d trials)...", request.n_trials)
             print(f"Optuna XGB search starting ({request.n_trials} trials)...")
             training_status = {"status": "tuning_xgb", "message": f"Optuna XGB caută parametri ({request.n_trials} trial-uri)..."}
@@ -636,13 +651,59 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             print(f"XGB best params: {study.best_params}")
             print(f"XGB val neg_log_loss: {study.best_value:.4f}")
 
-            logger.info("Refitting XGB on full train+val (%d rows)...", len(X_full_train))
-            print(f"Refitting XGB on full train+val ({len(X_full_train)} rows)...")
-            xgb_model = XGBClassifier(**study.best_params, eval_metric='mlogloss', random_state=42, n_jobs=-1)
-            xgb_model.fit(X_full_train, y_full_train_enc, sample_weight=sample_weights_full)
+            logger.info("Fitting XGB base on train (%d rows)...", len(X_train))
+            print(f"Fitting XGB base on train ({len(X_train)} rows)...")
+            xgb_base = XGBClassifier(**study.best_params, eval_metric='mlogloss', random_state=42, n_jobs=-1)
+            xgb_base.fit(X_train, y_train_enc, sample_weight=sample_weights_train)
+            # Isotonic calibration — XGB is tree-based and benefits from same non-parametric fit as RF
+            logger.info("Calibrating XGB on val (%d rows, isotonic)...", len(X_val))
+            print(f"Calibrating XGB on val ({len(X_val)} rows, isotonic)...")
+            training_status = {"status": "calibrating_xgb", "message": "Calibrare XGB (isotonic) pe val..."}
+            xgb_model = CalibratedClassifierCV(FrozenEstimator(xgb_base), method='isotonic', cv=5)
+            xgb_model.fit(X_val, y_val_enc)
 
-            # `y_train_enc` retained name for downstream evaluation code that referenced it
-            y_train_enc = y_full_train_enc
+            # Phase E: grid-search ensemble weights on val using calibrated probabilities.
+            # Step 0.05 (~231 combos) is dense enough; computed once on cached val probas.
+            logger.info("Searching ensemble weights on val...")
+            print("Searching ensemble weights on val...")
+            training_status = {"status": "ensemble_search", "message": "Caut greutățile ensemble pe val..."}
+
+            target_order_val = sorted(rf_model.classes_)
+            rf_val_p = rf_model.predict_proba(X_val)
+            lr_val_p = lr_model.predict_proba(X_val)
+            xgb_val_p_raw = xgb_model.predict_proba(X_val)
+            xgb_val_classes = le.inverse_transform(xgb_model.classes_)
+            xgb_val_col_map = [list(xgb_val_classes).index(c) for c in target_order_val]
+            xgb_val_p = xgb_val_p_raw[:, xgb_val_col_map]
+
+            y_val_arr = y_val.values
+            labels_arr = np.array(target_order_val)
+            best_ll = float('inf')
+            best_w = (0.4, 0.35, 0.25)
+            best_acc = 0.0
+            best_acc_w = best_w
+            STEP = 20  # 0.05 weight resolution
+            for i_xgb in range(STEP + 1):
+                for i_rf in range(STEP + 1 - i_xgb):
+                    i_lr = STEP - i_xgb - i_rf
+                    w_xgb = i_xgb / STEP
+                    w_rf = i_rf / STEP
+                    w_lr = i_lr / STEP
+                    ens = w_xgb * xgb_val_p + w_rf * rf_val_p + w_lr * lr_val_p
+                    ll = log_loss(y_val_arr, np.clip(ens, 1e-15, 1.0), labels=labels_arr)
+                    if ll < best_ll:
+                        best_ll = ll
+                        best_w = (w_xgb, w_rf, w_lr)
+                    acc = (labels_arr[np.argmax(ens, axis=1)] == y_val_arr).mean()
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_acc_w = (w_xgb, w_rf, w_lr)
+
+            ensemble_weights = {'xgb': best_w[0], 'rf': best_w[1], 'lr': best_w[2]}
+            logger.info("Best ensemble weights (log_loss=%.4f): %s | best-accuracy weights (val acc=%.4f): %s",
+                        best_ll, ensemble_weights, best_acc, best_acc_w)
+            print(f"Best ensemble weights (log_loss={best_ll:.4f}): {ensemble_weights}")
+            print(f"Best-accuracy weights (val acc={best_acc:.4f}): {best_acc_w}")
 
             # Evaluation
             logger.info("Evaluating models...")
@@ -665,7 +726,11 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             xgb_col_map = [list(xgb_class_order).index(c) for c in target_order]
             xgb_proba_reordered = xgb_proba[:, xgb_col_map]
 
-            ensemble_proba = 0.4 * xgb_proba_reordered + 0.35 * rf_proba + 0.25 * lr_proba
+            ensemble_proba = (
+                ensemble_weights['xgb'] * xgb_proba_reordered
+                + ensemble_weights['rf']  * rf_proba
+                + ensemble_weights['lr']  * lr_proba
+            )
             ensemble_preds = np.array(target_order)[np.argmax(ensemble_proba, axis=1)]
 
             acc_rf = accuracy_score(y_test, y_pred_rf)
@@ -674,6 +739,29 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             acc_ensemble = accuracy_score(y_test, ensemble_preds)
             logger.info("Accuracy RF=%.4f, LR=%.4f, XGB=%.4f, Ensemble=%.4f", acc_rf, acc_lr, acc_xgb, acc_ensemble)
             print(f"Accuracy RF={acc_rf:.4f}, LR={acc_lr:.4f}, XGB={acc_xgb:.4f}, Ensemble={acc_ensemble:.4f}")
+
+            # Phase F2: per-class diagnostic — exposes draw recall (the hard minority class)
+            target_names = ['Away', 'Draw', 'Home']  # corresponds to target_order = [-1, 0, 1]
+            ensemble_report_text = classification_report(
+                y_test, ensemble_preds, labels=target_order,
+                target_names=target_names, zero_division=0,
+            )
+            logger.info("Per-class ensemble report:\n%s", ensemble_report_text)
+            print("Per-class ensemble report:")
+            print(ensemble_report_text)
+            ensemble_report_dict = classification_report(
+                y_test, ensemble_preds, labels=target_order,
+                target_names=target_names, zero_division=0, output_dict=True,
+            )
+            per_class_summary = {
+                name: {
+                    "precision": round(float(ensemble_report_dict[name]['precision']), 4),
+                    "recall":    round(float(ensemble_report_dict[name]['recall']), 4),
+                    "f1":        round(float(ensemble_report_dict[name]['f1-score']), 4),
+                    "support":   int(ensemble_report_dict[name]['support']),
+                }
+                for name in target_names
+            }
 
             # Save
             logger.info("Saving models...")
@@ -686,6 +774,7 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             joblib.dump(xgb_model, 'models/xgb_model.pkl')
             joblib.dump(le, 'models/label_encoder.pkl')
             joblib.dump(feature_columns, 'models/feature_columns.pkl')
+            joblib.dump(ensemble_weights, 'models/ensemble_weights.pkl')
 
             logger.info("Training completed successfully!")
             print("Training completed successfully!")
@@ -697,7 +786,9 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 "accuracy_xgb": round(acc_xgb * 100, 2),
                 "accuracy_ensemble": round(acc_ensemble * 100, 2),
                 "test_matches": len(y_test),
-                "test_season": request.test_season
+                "test_season": request.test_season,
+                "ensemble_weights": {k: round(v, 4) for k, v in ensemble_weights.items()},
+                "per_class_ensemble": per_class_summary,
             }
         except Exception as e:
             logger.error("Training error: %s", str(e), exc_info=True)
