@@ -56,12 +56,13 @@ class PredictionResponse(BaseModel):
 def load_models():
     try:
         rf_model = joblib.load('models/random_forest_model.pkl')
+        lr_model = joblib.load('models/logistic_regression_model.pkl')
         xgb_model = joblib.load('models/xgb_model.pkl')
         le = joblib.load('models/label_encoder.pkl')
         feature_columns = joblib.load('models/feature_columns.pkl')
-        return rf_model, xgb_model, le, feature_columns
+        return rf_model, lr_model, xgb_model, le, feature_columns
     except Exception:
-        return None, None, None, None
+        return None, None, None, None, None
 
 
 def get_team_elo(team_name, elo_df=None, matches_df=None, is_home=True):
@@ -87,13 +88,24 @@ def get_team_recent_stats(team_name, matches_df, n=5):
         'HomeFouls': 'Fouls', 'HomeYellow': 'Yellow', 'HomeRed': 'Red',
         'Form3Home': 'Form3', 'Form5Home': 'Form5'
     })
+    home_matches['GoalsScored'] = matches_df.loc[home_matches.index, 'FTHome']
+    home_matches['GoalsConceded'] = matches_df.loc[home_matches.index, 'FTAway']
+    home_matches['Points'] = matches_df.loc[home_matches.index, 'FTResult'].map({'H': 3, 'D': 1, 'A': 0})
+    home_matches['Won'] = (matches_df.loc[home_matches.index, 'FTResult'] == 'H').astype(int)
+    home_matches['GoalDiff'] = home_matches['GoalsScored'] - home_matches['GoalsConceded']
     away_matches = matches_df[matches_df['AwayTeam'] == team_name].copy()
     away_matches = away_matches.rename(columns={
         'AwayShots': 'Shots', 'AwayTarget': 'Target', 'AwayCorners': 'Corners',
         'AwayFouls': 'Fouls', 'AwayYellow': 'Yellow', 'AwayRed': 'Red',
         'Form3Away': 'Form3', 'Form5Away': 'Form5'
     })
-    stat_cols = ['MatchDate', 'Shots', 'Target', 'Corners', 'Fouls', 'Yellow', 'Red', 'Form3', 'Form5']
+    away_matches['GoalsScored'] = matches_df.loc[away_matches.index, 'FTAway']
+    away_matches['GoalsConceded'] = matches_df.loc[away_matches.index, 'FTHome']
+    away_matches['Points'] = matches_df.loc[away_matches.index, 'FTResult'].map({'H': 0, 'D': 1, 'A': 3})
+    away_matches['Won'] = (matches_df.loc[away_matches.index, 'FTResult'] == 'A').astype(int)
+    away_matches['GoalDiff'] = away_matches['GoalsScored'] - away_matches['GoalsConceded']
+    stat_cols = ['MatchDate', 'Shots', 'Target', 'Corners', 'Fouls', 'Yellow', 'Red', 'Form3', 'Form5',
+                 'GoalsScored', 'GoalsConceded', 'Points', 'Won', 'GoalDiff']
     existing_home = [c for c in stat_cols if c in home_matches.columns]
     existing_away = [c for c in stat_cols if c in away_matches.columns]
     all_matches = pd.concat([
@@ -104,9 +116,24 @@ def get_team_recent_stats(team_name, matches_df, n=5):
         return {}
     recent = all_matches.tail(n)
     stats = {}
-    for col in ['Shots', 'Target', 'Corners', 'Fouls', 'Yellow', 'Red', 'Form3', 'Form5']:
+    for col in ['Shots', 'Target', 'Corners', 'Fouls', 'Yellow', 'Red', 'Form3', 'Form5',
+                'GoalsScored', 'GoalsConceded', 'Points', 'GoalDiff']:
         if col in recent.columns:
             stats[col] = recent[col].fillna(0).mean()
+    if 'Target' in stats and 'Shots' in stats and stats['Shots'] > 0:
+        stats['ShotConversion'] = stats['Target'] / stats['Shots']
+    else:
+        stats['ShotConversion'] = 0
+    # Win streak from most recent games
+    all_recent = all_matches.tail(10)
+    streak = 0
+    if len(all_recent) > 0 and 'Won' in all_recent.columns:
+        for val in reversed(all_recent['Won'].fillna(0).tolist()):
+            if val == 1:
+                streak += 1
+            else:
+                break
+    stats['WinStreak'] = streak
     return stats
 
 
@@ -117,37 +144,85 @@ def build_feature_vector(home_team, away_team, matches_df, elo_df, feature_colum
     away_stats = get_team_recent_stats(away_team, matches_df)
     elo_diff = home_elo - away_elo
     elo_total = home_elo + away_elo
+
+    # Get latest odds for this matchup if available
+    odds = {'OddHome': None, 'OddDraw': None, 'OddAway': None}
+    if matches_df is not None:
+        matchup = matches_df[
+            (matches_df['HomeTeam'] == home_team) & (matches_df['AwayTeam'] == away_team)
+        ].sort_values('MatchDate')
+        if len(matchup) > 0 and 'OddHome' in matchup.columns:
+            last = matchup.iloc[-1]
+            for k in odds:
+                if k in last and pd.notna(last[k]):
+                    odds[k] = last[k]
+    # Compute implied probabilities
+    impl_home = 1.0 / odds['OddHome'] if odds['OddHome'] else 0.33
+    impl_draw = 1.0 / odds['OddDraw'] if odds['OddDraw'] else 0.33
+    impl_away = 1.0 / odds['OddAway'] if odds['OddAway'] else 0.33
+    margin = impl_home + impl_draw + impl_away
+    impl_home /= margin
+    impl_draw /= margin
+    impl_away /= margin
+
     features = []
     for col in feature_columns:
         val = None
-        if col == 'HomeElo':             val = home_elo
-        elif col == 'AwayElo':           val = away_elo
-        elif col == 'EloDifference':     val = elo_diff
-        elif col == 'EloTotal':          val = elo_total
-        elif col == 'Form3Home':         val = home_stats.get('Form3', 0)
-        elif col == 'Form5Home':         val = home_stats.get('Form5', 0)
-        elif col == 'Form3Away':         val = away_stats.get('Form3', 0)
-        elif col == 'Form5Away':         val = away_stats.get('Form5', 0)
-        elif col == 'Form3Diff':         val = home_stats.get('Form3', 0) - away_stats.get('Form3', 0)
-        elif col == 'Form5Diff':         val = home_stats.get('Form5', 0) - away_stats.get('Form5', 0)
-        elif col == 'HomeShots':         val = home_stats.get('Shots', 0)
-        elif col == 'AwayShots':         val = away_stats.get('Shots', 0)
-        elif col == 'ShotsDifference':   val = home_stats.get('Shots', 0) - away_stats.get('Shots', 0)
-        elif col == 'HomeTarget':        val = home_stats.get('Target', 0)
-        elif col == 'AwayTarget':        val = away_stats.get('Target', 0)
-        elif col == 'HomeCorners':       val = home_stats.get('Corners', 0)
-        elif col == 'AwayCorners':       val = away_stats.get('Corners', 0)
-        elif col == 'CornersDifference': val = home_stats.get('Corners', 0) - away_stats.get('Corners', 0)
-        elif col == 'HomeFouls':         val = home_stats.get('Fouls', 0)
-        elif col == 'AwayFouls':         val = away_stats.get('Fouls', 0)
-        elif col == 'HomeYellow':        val = home_stats.get('Yellow', 0)
-        elif col == 'AwayYellow':        val = away_stats.get('Yellow', 0)
-        elif col == 'HomeRed':           val = home_stats.get('Red', 0)
-        elif col == 'AwayRed':           val = away_stats.get('Red', 0)
-        elif col == 'CardPointsHome':    val = home_stats.get('Yellow', 0) + 2 * home_stats.get('Red', 0)
-        elif col == 'CardPointsAway':    val = away_stats.get('Yellow', 0) + 2 * away_stats.get('Red', 0)
-        elif col == 'Year':              val = pd.Timestamp.now().year
-        else:                            val = 0
+        if col == 'HomeElo':               val = home_elo
+        elif col == 'AwayElo':             val = away_elo
+        elif col == 'EloDifference':       val = elo_diff
+        elif col == 'EloTotal':            val = elo_total
+        elif col == 'Form3Home':           val = home_stats.get('Form3', 0)
+        elif col == 'Form5Home':           val = home_stats.get('Form5', 0)
+        elif col == 'Form3Away':           val = away_stats.get('Form3', 0)
+        elif col == 'Form5Away':           val = away_stats.get('Form5', 0)
+        elif col == 'Form3Diff':           val = home_stats.get('Form3', 0) - away_stats.get('Form3', 0)
+        elif col == 'Form5Diff':           val = home_stats.get('Form5', 0) - away_stats.get('Form5', 0)
+        elif col == 'HomeShots':           val = home_stats.get('Shots', 0)
+        elif col == 'AwayShots':           val = away_stats.get('Shots', 0)
+        elif col == 'ShotsDifference':     val = home_stats.get('Shots', 0) - away_stats.get('Shots', 0)
+        elif col == 'HomeTarget':          val = home_stats.get('Target', 0)
+        elif col == 'AwayTarget':          val = away_stats.get('Target', 0)
+        elif col == 'HomeCorners':         val = home_stats.get('Corners', 0)
+        elif col == 'AwayCorners':         val = away_stats.get('Corners', 0)
+        elif col == 'CornersDifference':   val = home_stats.get('Corners', 0) - away_stats.get('Corners', 0)
+        elif col == 'HomeFouls':           val = home_stats.get('Fouls', 0)
+        elif col == 'AwayFouls':           val = away_stats.get('Fouls', 0)
+        elif col == 'HomeYellow':          val = home_stats.get('Yellow', 0)
+        elif col == 'AwayYellow':          val = away_stats.get('Yellow', 0)
+        elif col == 'HomeRed':             val = home_stats.get('Red', 0)
+        elif col == 'AwayRed':             val = away_stats.get('Red', 0)
+        elif col == 'CardPointsHome':      val = home_stats.get('Yellow', 0) + 2 * home_stats.get('Red', 0)
+        elif col == 'CardPointsAway':      val = away_stats.get('Yellow', 0) + 2 * away_stats.get('Red', 0)
+        elif col == 'Year':                val = pd.Timestamp.now().year
+        # Betting odds features
+        elif col == 'ImpliedProbHome':     val = impl_home
+        elif col == 'ImpliedProbDraw':     val = impl_draw
+        elif col == 'ImpliedProbAway':     val = impl_away
+        elif col == 'OddsDiffHomeAway':    val = impl_home - impl_away
+        # Shot conversion
+        elif col == 'HomeShotConversion':  val = home_stats.get('ShotConversion', 0)
+        elif col == 'AwayShotConversion':  val = away_stats.get('ShotConversion', 0)
+        elif col == 'ShotConversionDiff':  val = home_stats.get('ShotConversion', 0) - away_stats.get('ShotConversion', 0)
+        # Win streaks
+        elif col == 'Home_WinStreak':      val = home_stats.get('WinStreak', 0)
+        elif col == 'Away_WinStreak':      val = away_stats.get('WinStreak', 0)
+        elif col == 'WinStreakDiff':       val = home_stats.get('WinStreak', 0) - away_stats.get('WinStreak', 0)
+        # Rolling stats (use recent stats as proxy)
+        elif 'GoalsScored' in col and 'Home' in col:    val = home_stats.get('GoalsScored', 0)
+        elif 'GoalsScored' in col and 'Away' in col:    val = away_stats.get('GoalsScored', 0)
+        elif 'GoalsConceded' in col and 'Home' in col:  val = home_stats.get('GoalsConceded', 0)
+        elif 'GoalsConceded' in col and 'Away' in col:  val = away_stats.get('GoalsConceded', 0)
+        elif 'Points' in col and 'Home' in col:         val = home_stats.get('Points', 0)
+        elif 'Points' in col and 'Away' in col:         val = away_stats.get('Points', 0)
+        elif 'GoalDiff' in col and 'Home' in col:       val = home_stats.get('GoalDiff', 0)
+        elif 'GoalDiff' in col and 'Away' in col:       val = away_stats.get('GoalDiff', 0)
+        elif 'Won' in col and 'Home' in col:            val = home_stats.get('Points', 0) / 3 if home_stats.get('Points', 0) else 0
+        elif 'Won' in col and 'Away' in col:            val = away_stats.get('Points', 0) / 3 if away_stats.get('Points', 0) else 0
+        elif 'ShotsOnTarget' in col and 'Home' in col:  val = home_stats.get('Target', 0)
+        elif 'ShotsOnTarget' in col and 'Away' in col:  val = away_stats.get('Target', 0)
+        elif 'GoalsScored_Diff' in col:                 val = home_stats.get('GoalsScored', 0) - away_stats.get('GoalsScored', 0)
+        else:                              val = 0
         features.append(val if val is not None else 0)
     return np.array([features]), home_elo, away_elo
 
@@ -164,7 +239,7 @@ async def predict_match(request: PredictionRequest):
     try:
         logger.info("Prediction request: %s vs %s", request.home_team, request.away_team)
         print(f"Prediction request: {request.home_team} vs {request.away_team}")
-        rf_model, xgb_model, le, feature_columns = load_models()
+        rf_model, lr_model, xgb_model, le, feature_columns = load_models()
 
         if rf_model is None or feature_columns is None:
             logger.warning("Models not loaded - returning 503")
@@ -206,16 +281,27 @@ async def predict_match(request: PredictionRequest):
 
         logger.info("Running prediction (HomeElo=%.1f, AwayElo=%.1f)", home_elo, away_elo)
         print(f"Running prediction (HomeElo={home_elo:.1f}, AwayElo={away_elo:.1f})")
-        # XGBoost prediction (Optuna-optimized)
-        xgb_pred_enc = xgb_model.predict(features)[0]
-        prediction = le.inverse_transform([xgb_pred_enc])[0]  # decode back to -1, 0, 1
 
-        xgb_proba = xgb_model.predict_proba(features)[0]
-        # Map encoded class indices back to original labels
+        # Get probabilities from all 3 models
+        rf_proba = rf_model.predict_proba(features)[0]    # classes: [-1, 0, 1]
+        lr_proba = lr_model.predict_proba(features)[0]    # classes: [-1, 0, 1]
+        xgb_proba_raw = xgb_model.predict_proba(features)[0]  # classes: encoded
+
+        # Reorder XGB proba to match [-1, 0, 1] order
+        xgb_class_order = le.inverse_transform(xgb_model.classes_)
+        target_order = sorted(rf_model.classes_)
+        xgb_col_map = [list(xgb_class_order).index(c) for c in target_order]
+        xgb_proba = xgb_proba_raw[xgb_col_map]
+
+        # Ensemble: weighted average of probabilities
+        ensemble_proba = 0.4 * xgb_proba + 0.35 * rf_proba + 0.25 * lr_proba
+
+        # Map to original labels: target_order = [-1, 0, 1]
+        prediction = target_order[np.argmax(ensemble_proba)]
+
         prob_dict = {}
-        for i, cls_enc in enumerate(xgb_model.classes_):
-            original_label = le.inverse_transform([cls_enc])[0]
-            prob_dict[str(int(original_label))] = xgb_proba[i] * 100
+        for i, label in enumerate(target_order):
+            prob_dict[str(int(label))] = ensemble_proba[i] * 100
 
         result_map = {
             1.0:  "🏠 Câștigă ACASĂ",
@@ -229,14 +315,14 @@ async def predict_match(request: PredictionRequest):
 
         logger.info("Prediction result: %s -> %s (confidence: %.1f%%)",
                     f"{request.home_team} vs {request.away_team}",
-                    result_map.get(prediction, "???"), max(xgb_proba) * 100)
+                    result_map.get(prediction, "???"), max(ensemble_proba) * 100)
         print(f"Prediction result: {request.home_team} vs {request.away_team} -> "
-              f"{result_map.get(prediction, '???')} (confidence: {max(xgb_proba) * 100:.1f}%)")
+              f"{result_map.get(prediction, '???')} (confidence: {max(ensemble_proba) * 100:.1f}%)")
 
         return {
             "match": f"{request.home_team} vs {request.away_team}",
             "prediction": result_map.get(prediction, "❓ ???"),
-            "confidence": max(xgb_proba) * 100,
+            "confidence": max(ensemble_proba) * 100,
             "home_team": request.home_team,
             "away_team": request.away_team,
             "home_elo": round(home_elo, 2),
