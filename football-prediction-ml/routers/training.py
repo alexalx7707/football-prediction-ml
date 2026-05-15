@@ -21,6 +21,9 @@ from sklearn.metrics import accuracy_score, classification_report, log_loss
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from xgboost import XGBClassifier
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend (FastAPI background task, no display)
+import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -101,7 +104,7 @@ def compute_side_form(df, team_col, points_series, goaldiff_series, prefix, wind
             col = f'{prefix}_{stat}_Last{window}'
             side[col] = (
                 side.groupby('Team')[stat]
-                .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+                .transform(lambda x: x.shift(1).ewm(span=window, min_periods=1).mean())
             )
             new_cols.append(col)
 
@@ -346,6 +349,15 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 df_model['ShotConversionDiff'] = df_model['HomeShotConversion'] - df_model['AwayShotConversion']
                 feature_columns.extend(['HomeShotConversion', 'AwayShotConversion', 'ShotConversionDiff'])
 
+            # --- xG-style proxy: 0.30 per on-target shot + 0.05 per off-target shot ---
+            if all(c in df_model.columns for c in ['HomeShots', 'HomeTarget', 'AwayShots', 'AwayTarget']):
+                df_model['HomeXG'] = (df_model['HomeTarget'].fillna(0) * 0.30
+                                       + (df_model['HomeShots'].fillna(0) - df_model['HomeTarget'].fillna(0)).clip(lower=0) * 0.05)
+                df_model['AwayXG'] = (df_model['AwayTarget'].fillna(0) * 0.30
+                                       + (df_model['AwayShots'].fillna(0) - df_model['AwayTarget'].fillna(0)).clip(lower=0) * 0.05)
+                df_model['XGDiff'] = df_model['HomeXG'] - df_model['AwayXG']
+                feature_columns.extend(['HomeXG', 'AwayXG', 'XGDiff'])
+
             # --- Goal difference (FTHome - FTAway as a feature for rolling) ---
             df_model['GoalDifference'] = df_model['FTHome'] - df_model['FTAway']
 
@@ -371,6 +383,15 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
 
             # Build unified match records: each match creates two rows (one per team)
             is_draw_series = (df_model['FTResult'] == 'D').astype(int)
+            # Mean Elo across all team-appearances — used to normalize the opponent-strength multiplier.
+            elo_baseline = float(
+                pd.concat([df_model['HomeElo'], df_model['AwayElo']]).dropna().mean()
+            ) if 'HomeElo' in df_model.columns else 1500.0
+            if not np.isfinite(elo_baseline) or elo_baseline <= 0:
+                elo_baseline = 1500.0
+            logger.info("League Elo baseline: %.2f", elo_baseline)
+            print(f"League Elo baseline: {elo_baseline:.2f}")
+
             home_records = pd.DataFrame({
                 'MatchDate': df_model['MatchDate'],
                 'Team': df_model['HomeTeam'],
@@ -381,6 +402,8 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 'IsDraw': is_draw_series,
                 'GoalDiff': df_model['FTHome'] - df_model['FTAway'],
                 'ShotsOnTarget': df_model.get('HomeTarget', pd.Series(0, index=df_model.index)),
+                'XG': df_model.get('HomeXG', pd.Series(0.0, index=df_model.index)),
+                'OppElo': df_model.get('AwayElo', pd.Series(elo_baseline, index=df_model.index)),
                 'OrigIdx': df_model.index,
                 'Role': 'home'
             })
@@ -394,6 +417,8 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 'IsDraw': is_draw_series,
                 'GoalDiff': df_model['FTAway'] - df_model['FTHome'],
                 'ShotsOnTarget': df_model.get('AwayTarget', pd.Series(0, index=df_model.index)),
+                'XG': df_model.get('AwayXG', pd.Series(0.0, index=df_model.index)),
+                'OppElo': df_model.get('HomeElo', pd.Series(elo_baseline, index=df_model.index)),
                 'OrigIdx': df_model.index,
                 'Role': 'away'
             })
@@ -401,18 +426,34 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             all_team_matches = pd.concat([home_records, away_records], ignore_index=True)
             all_team_matches = all_team_matches.sort_values(['Team', 'MatchDate']).reset_index(drop=True)
 
+            # Opponent-strength-weighted per-match stats: scoring vs strong opponents counts more.
+            # Multiplier = OppElo / league_elo_baseline (≈1 against average, >1 vs strong, <1 vs weak).
+            elo_mult = (all_team_matches['OppElo'].fillna(elo_baseline) / elo_baseline).clip(0.5, 1.5)
+            for stat in ['GoalsScored', 'GoalsConceded', 'Points', 'GoalDiff', 'XG']:
+                all_team_matches[f'{stat}_EloWtd'] = all_team_matches[stat].fillna(0) * elo_mult
+
             # Days-since-last-match per team (rest / fixture congestion)
             all_team_matches['DaysSinceLast'] = (
                 all_team_matches.groupby('Team')['MatchDate']
                 .diff().dt.days.fillna(14)
             )
 
-            # Compute rolling averages per team across all their matches
+            # Compute rolling averages per team across all their matches.
+            # EWM (exponential moving average) with span=window weights recent matches more —
+            # last match contributes ~2/(span+1) of the value, older matches decay exponentially.
+            # shift(1) is preserved so the current match is never in its own rolling window.
+            rolling_stat_list = [
+                'GoalsScored', 'GoalsConceded', 'Points', 'GoalDiff',
+                'Won', 'ShotsOnTarget', 'IsDraw', 'XG',
+                # Opponent-Elo-weighted variants (per-match value scaled by opponent strength)
+                'GoalsScored_EloWtd', 'GoalsConceded_EloWtd', 'Points_EloWtd',
+                'GoalDiff_EloWtd', 'XG_EloWtd',
+            ]
             for window in [5, 10]:
-                for stat in ['GoalsScored', 'GoalsConceded', 'Points', 'GoalDiff', 'Won', 'ShotsOnTarget', 'IsDraw']:
+                for stat in rolling_stat_list:
                     all_team_matches[f'{stat}_Last{window}'] = (
                         all_team_matches.groupby('Team')[stat]
-                        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+                        .transform(lambda x: x.shift(1).ewm(span=window, min_periods=1).mean())
                     )
 
             # Win streak: count consecutive wins looking backwards
@@ -453,6 +494,12 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 df_model[f'GoalsScored_Diff_Last{window}'] = (
                     df_model[f'Home_GoalsScored_Last{window}'] - df_model[f'Away_GoalsScored_Last{window}']
                 )
+                # Diff variants for opponent-Elo-weighted rolling stats
+                for stat in ['GoalsScored_EloWtd', 'GoalsConceded_EloWtd', 'Points_EloWtd',
+                             'GoalDiff_EloWtd', 'XG_EloWtd']:
+                    df_model[f'{stat}_Diff_Last{window}'] = (
+                        df_model[f'Home_{stat}_Last{window}'] - df_model[f'Away_{stat}_Last{window}']
+                    )
 
             rolling_feature_cols = [col for col in df_model.columns
                                     if 'Last5' in col or 'Last10' in col
@@ -528,9 +575,50 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             y_val = val_df['Result']
             X_test = test_df[feature_columns].fillna(0)
             y_test = test_df['Result']
-            logger.info("Train: %d, Val: %d, Test: %d, Features: %d",
+            logger.info("Train: %d, Val: %d, Test: %d, Features: %d (pre-selection)",
                         len(X_train), len(X_val), len(X_test), len(feature_columns))
-            print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}, Features: {len(feature_columns)}")
+            print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}, Features: {len(feature_columns)} (pre-selection)")
+
+            # --- Inline feature selection pre-pass ---
+            # Fit a fast exploratory XGB on train, drop features with importance < 0.001.
+            # Reduces LR noise and shrinks the calibration matrix without retraining twice.
+            logger.info("Feature selection pre-pass (fast XGB)...")
+            print("Feature selection pre-pass (fast XGB)...")
+            training_status = {"status": "feature_selection", "message": "Selecție caracteristici (XGB rapid)..."}
+            try:
+                fs_le = LabelEncoder().fit(y_train)
+                fs_xgb = XGBClassifier(
+                    n_estimators=150, max_depth=5, learning_rate=0.1,
+                    eval_metric='mlogloss', random_state=42, n_jobs=-1,
+                )
+                fs_xgb.fit(X_train, fs_le.transform(y_train))
+                fs_importances = fs_xgb.feature_importances_
+                IMPORTANCE_THRESHOLD = 0.001
+                kept_mask = fs_importances >= IMPORTANCE_THRESHOLD
+                # Safety: never drop more than 60% — if a tiny model says half the features are zero,
+                # something's off; keep at least the top 40% by importance.
+                if kept_mask.sum() < max(10, int(len(feature_columns) * 0.4)):
+                    cutoff = int(len(feature_columns) * 0.6)
+                    kept_idx = np.argsort(fs_importances)[::-1][:cutoff]
+                    kept_mask = np.zeros_like(fs_importances, dtype=bool)
+                    kept_mask[kept_idx] = True
+                kept_features = [c for c, k in zip(feature_columns, kept_mask) if k]
+                dropped_features = [c for c, k in zip(feature_columns, kept_mask) if not k]
+                logger.info("Dropped %d/%d features below threshold %g",
+                            len(dropped_features), len(feature_columns), IMPORTANCE_THRESHOLD)
+                print(f"Dropped {len(dropped_features)}/{len(feature_columns)} features below threshold {IMPORTANCE_THRESHOLD}")
+                if dropped_features:
+                    logger.info("Dropped features (first 20): %s", dropped_features[:20])
+                feature_columns = kept_features
+                X_train = X_train[feature_columns]
+                X_val = X_val[feature_columns]
+                X_test = X_test[feature_columns]
+            except Exception as fs_err:
+                logger.warning("Feature selection pre-pass failed (continuing with full set): %s", fs_err)
+                print(f"Feature selection pre-pass failed (continuing with full set): {fs_err}")
+
+            logger.info("Final feature count: %d", len(feature_columns))
+            print(f"Final feature count: {len(feature_columns)}")
 
             # Tuning subsample: hyperparameter rankings are stable on a ~60k subset.
             # Take the most-recent training rows (most relevant for the test period).
@@ -662,11 +750,65 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             xgb_model = CalibratedClassifierCV(FrozenEstimator(xgb_base), method='isotonic', cv=5)
             xgb_model.fit(X_val, y_val_enc)
 
-            # Phase E: grid-search ensemble weights on val using calibrated probabilities.
-            # Step 0.05 (~231 combos) is dense enough; computed once on cached val probas.
-            logger.info("Searching ensemble weights on val...")
-            print("Searching ensemble weights on val...")
-            training_status = {"status": "ensemble_search", "message": "Caut greutățile ensemble pe val..."}
+            # --- Draw-specialist binary classifier (IsDraw vs not-Draw) ---
+            # The 3-way ensemble has historically weak draw recall — a dedicated binary model
+            # gives the meta-learner an extra signal focused on the hardest class.
+            logger.info("Training draw-specialist binary classifier...")
+            print("Training draw-specialist binary classifier...")
+            training_status = {"status": "draw_specialist", "message": "Antrenez modelul specializat pe egaluri..."}
+
+            y_train_draw = (y_train == 0).astype(int)
+            y_val_draw = (y_val == 0).astype(int)
+            n_draw = int(y_train_draw.sum())
+            n_non_draw = int(len(y_train_draw) - n_draw)
+            scale_pos_weight = (n_non_draw / max(n_draw, 1))
+            logger.info("Draw class balance: %d draws / %d non-draws (scale_pos_weight=%.2f)",
+                        n_draw, n_non_draw, scale_pos_weight)
+            print(f"Draw class balance: {n_draw} draws / {n_non_draw} non-draws (scale_pos_weight={scale_pos_weight:.2f})")
+
+            def draw_objective(trial):
+                params = {
+                    'n_estimators':     trial.suggest_int('n_estimators', 100, 300),
+                    'max_depth':        trial.suggest_int('max_depth', 3, 7),
+                    'learning_rate':    trial.suggest_float('learning_rate', 0.02, 0.15),
+                    'subsample':        trial.suggest_float('subsample', 0.7, 1.0),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
+                    'scale_pos_weight': scale_pos_weight,
+                    'eval_metric':      'logloss',
+                    'random_state':     42,
+                    'n_jobs':           -1,
+                }
+                m = XGBClassifier(**params)
+                m.fit(X_tune, (y_tune == 0).astype(int))
+                proba = m.predict_proba(X_val)
+                return -log_loss(y_val_draw, proba, labels=[0, 1])
+
+            draw_study = optuna.create_study(direction='maximize')
+            DRAW_TRIALS = max(5, min(10, request.n_trials))
+            draw_study.optimize(draw_objective, n_trials=DRAW_TRIALS, show_progress_bar=False)
+            logger.info("Draw-specialist best params: %s (val neg_log_loss=%.4f)",
+                        draw_study.best_params, draw_study.best_value)
+            print(f"Draw-specialist best params: {draw_study.best_params}, val neg_log_loss={draw_study.best_value:.4f}")
+
+            draw_base = XGBClassifier(
+                **draw_study.best_params,
+                scale_pos_weight=scale_pos_weight,
+                eval_metric='logloss', random_state=42, n_jobs=-1,
+            )
+            draw_base.fit(X_train, y_train_draw)
+            logger.info("Calibrating draw-specialist on val (isotonic)...")
+            print("Calibrating draw-specialist on val (isotonic)...")
+            draw_model = CalibratedClassifierCV(FrozenEstimator(draw_base), method='isotonic', cv=5)
+            draw_model.fit(X_val, y_val_draw)
+
+            # Stacking meta-learner — replaces the fixed-weight blend.
+            # Inputs: per-row probabilities from the three base models (3 columns each, ordered [-1,0,1])
+            # plus the draw-specialist's "is-draw" probability. 10 columns total.
+            # The meta-LR can condition on context (e.g. when odds are tight, trust XGB more) in a way
+            # that a single global weight triple cannot.
+            logger.info("Training stacking meta-learner on val probabilities...")
+            print("Training stacking meta-learner on val probabilities...")
+            training_status = {"status": "meta_learner", "message": "Antrenez meta-learner-ul (stacking)..."}
 
             target_order_val = sorted(rf_model.classes_)
             rf_val_p = rf_model.predict_proba(X_val)
@@ -675,35 +817,28 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             xgb_val_classes = le.inverse_transform(xgb_model.classes_)
             xgb_val_col_map = [list(xgb_val_classes).index(c) for c in target_order_val]
             xgb_val_p = xgb_val_p_raw[:, xgb_val_col_map]
+            draw_val_p = draw_model.predict_proba(X_val)[:, 1:2]  # (n_val, 1) — P(IsDraw)
 
-            y_val_arr = y_val.values
-            labels_arr = np.array(target_order_val)
-            best_ll = float('inf')
-            best_w = (0.4, 0.35, 0.25)
-            best_acc = 0.0
-            best_acc_w = best_w
-            STEP = 20  # 0.05 weight resolution
-            for i_xgb in range(STEP + 1):
-                for i_rf in range(STEP + 1 - i_xgb):
-                    i_lr = STEP - i_xgb - i_rf
-                    w_xgb = i_xgb / STEP
-                    w_rf = i_rf / STEP
-                    w_lr = i_lr / STEP
-                    ens = w_xgb * xgb_val_p + w_rf * rf_val_p + w_lr * lr_val_p
-                    ll = log_loss(y_val_arr, np.clip(ens, 1e-15, 1.0), labels=labels_arr)
-                    if ll < best_ll:
-                        best_ll = ll
-                        best_w = (w_xgb, w_rf, w_lr)
-                    acc = (labels_arr[np.argmax(ens, axis=1)] == y_val_arr).mean()
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_acc_w = (w_xgb, w_rf, w_lr)
+            meta_X_val = np.hstack([rf_val_p, lr_val_p, xgb_val_p, draw_val_p])
+            meta_feature_names = (
+                [f'rf_{c}' for c in target_order_val]
+                + [f'lr_{c}' for c in target_order_val]
+                + [f'xgb_{c}' for c in target_order_val]
+                + ['draw_specialist_p']
+            )
 
-            ensemble_weights = {'xgb': best_w[0], 'rf': best_w[1], 'lr': best_w[2]}
-            logger.info("Best ensemble weights (log_loss=%.4f): %s | best-accuracy weights (val acc=%.4f): %s",
-                        best_ll, ensemble_weights, best_acc, best_acc_w)
-            print(f"Best ensemble weights (log_loss={best_ll:.4f}): {ensemble_weights}")
-            print(f"Best-accuracy weights (val acc={best_acc:.4f}): {best_acc_w}")
+            meta_learner = LogisticRegression(
+                solver='lbfgs', max_iter=2000,
+                C=1.0, random_state=42,
+            )
+            meta_learner.fit(meta_X_val, y_val)
+
+            # Log meta coefficients (one row per class, one col per meta input)
+            for cls_idx, cls in enumerate(meta_learner.classes_):
+                coefs = dict(zip(meta_feature_names, meta_learner.coef_[cls_idx]))
+                logger.info("Meta coefs for class %s: %s", cls,
+                            {k: round(v, 3) for k, v in coefs.items()})
+                print(f"Meta coefs for class {cls}: {{ {', '.join(f'{k}: {v:.3f}' for k, v in coefs.items())} }}")
 
             # Evaluation
             logger.info("Evaluating models...")
@@ -715,30 +850,32 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             y_pred_xgb_enc = xgb_model.predict(X_test)
             y_pred_xgb = le.inverse_transform(y_pred_xgb_enc)
 
-            # Ensemble: weighted average of probabilities from all 3 models
-            # RF and LR predict original labels (-1, 0, 1); XGB uses encoded labels
+            # Build meta-input matrix on test set the same way as on val
             rf_proba = rf_model.predict_proba(X_test)   # classes: [-1, 0, 1]
             lr_proba = lr_model.predict_proba(X_test)   # classes: [-1, 0, 1]
             xgb_proba = xgb_model.predict_proba(X_test) # classes: encoded
-            # Reorder XGB proba columns to match [-1, 0, 1] order
             xgb_class_order = le.inverse_transform(xgb_model.classes_)
             target_order = sorted(rf_model.classes_)
             xgb_col_map = [list(xgb_class_order).index(c) for c in target_order]
             xgb_proba_reordered = xgb_proba[:, xgb_col_map]
+            draw_proba_test = draw_model.predict_proba(X_test)[:, 1:2]
 
-            ensemble_proba = (
-                ensemble_weights['xgb'] * xgb_proba_reordered
-                + ensemble_weights['rf']  * rf_proba
-                + ensemble_weights['lr']  * lr_proba
-            )
-            ensemble_preds = np.array(target_order)[np.argmax(ensemble_proba, axis=1)]
+            meta_X_test = np.hstack([rf_proba, lr_proba, xgb_proba_reordered, draw_proba_test])
+            ensemble_proba = meta_learner.predict_proba(meta_X_test)
+            # meta_learner.classes_ matches target_order (sorted), so argmax indexes into it
+            ensemble_preds = meta_learner.classes_[np.argmax(ensemble_proba, axis=1)]
 
             acc_rf = accuracy_score(y_test, y_pred_rf)
             acc_lr = accuracy_score(y_test, y_pred_lr)
             acc_xgb = accuracy_score(y_test, y_pred_xgb)
             acc_ensemble = accuracy_score(y_test, ensemble_preds)
-            logger.info("Accuracy RF=%.4f, LR=%.4f, XGB=%.4f, Ensemble=%.4f", acc_rf, acc_lr, acc_xgb, acc_ensemble)
-            print(f"Accuracy RF={acc_rf:.4f}, LR={acc_lr:.4f}, XGB={acc_xgb:.4f}, Ensemble={acc_ensemble:.4f}")
+            ensemble_log_loss = log_loss(
+                y_test, np.clip(ensemble_proba, 1e-15, 1.0),
+                labels=meta_learner.classes_,
+            )
+            logger.info("Accuracy RF=%.4f, LR=%.4f, XGB=%.4f, Ensemble=%.4f, Ensemble log_loss=%.4f",
+                        acc_rf, acc_lr, acc_xgb, acc_ensemble, ensemble_log_loss)
+            print(f"Accuracy RF={acc_rf:.4f}, LR={acc_lr:.4f}, XGB={acc_xgb:.4f}, Ensemble={acc_ensemble:.4f}, log_loss={ensemble_log_loss:.4f}")
 
             # Phase F2: per-class diagnostic — exposes draw recall (the hard minority class)
             target_names = ['Away', 'Draw', 'Home']  # corresponds to target_order = [-1, 0, 1]
@@ -763,6 +900,44 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 for name in target_names
             }
 
+            # Feature importance dump (RF + XGB; base estimators retain importances after calibration wrap)
+            try:
+                importance_df = pd.DataFrame({
+                    'feature':        feature_columns,
+                    'rf_importance':  rf_base.feature_importances_,
+                    'xgb_importance': xgb_base.feature_importances_,
+                })
+                importance_df['avg_importance'] = (
+                    importance_df['rf_importance'] + importance_df['xgb_importance']
+                ) / 2.0
+                importance_df = importance_df.sort_values('avg_importance', ascending=False).reset_index(drop=True)
+                os.makedirs('models', exist_ok=True)
+                importance_df.to_csv('models/feature_importance.csv', index=False)
+                top15 = importance_df.head(15).to_string(index=False)
+                logger.info("Top 15 features by avg importance (RF+XGB):\n%s", top15)
+                print("Top 15 features by avg importance (RF+XGB):")
+                print(top15)
+
+                # Bar chart (top 40 by avg_importance; grouped RF vs XGB)
+                plot_df = importance_df.head(40)
+                n = len(plot_df)
+                x = np.arange(n)
+                width = 0.4
+                fig, ax = plt.subplots(figsize=(max(12, n * 0.35), 6))
+                ax.bar(x - width / 2, plot_df['rf_importance'], width, label='Random Forest')
+                ax.bar(x + width / 2, plot_df['xgb_importance'], width, label='XGBoost')
+                ax.set_xticks(x)
+                ax.set_xticklabels(plot_df['feature'], rotation=45, ha='right')
+                ax.set_ylabel('Importanță')
+                ax.set_title('Importanța caracteristicilor (RF + XGB, top 40)')
+                ax.legend()
+                fig.tight_layout()
+                fig.savefig('models/feature_importance.png', dpi=120)
+                plt.close(fig)
+            except Exception as fi_err:
+                logger.warning("Feature importance dump failed: %s", fi_err)
+                print(f"Feature importance dump failed: {fi_err}")
+
             # Save
             logger.info("Saving models...")
             print("Saving models...")
@@ -774,7 +949,9 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             joblib.dump(xgb_model, 'models/xgb_model.pkl')
             joblib.dump(le, 'models/label_encoder.pkl')
             joblib.dump(feature_columns, 'models/feature_columns.pkl')
-            joblib.dump(ensemble_weights, 'models/ensemble_weights.pkl')
+            joblib.dump(elo_baseline, 'models/league_elo_baseline.pkl')
+            joblib.dump(draw_model, 'models/draw_specialist_model.pkl')
+            joblib.dump(meta_learner, 'models/meta_learner.pkl')
 
             logger.info("Training completed successfully!")
             print("Training completed successfully!")
@@ -785,10 +962,11 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
                 "accuracy_lr": round(acc_lr * 100, 2),
                 "accuracy_xgb": round(acc_xgb * 100, 2),
                 "accuracy_ensemble": round(acc_ensemble * 100, 2),
+                "ensemble_log_loss": round(float(ensemble_log_loss), 4),
                 "test_matches": len(y_test),
                 "test_season": request.test_season,
-                "ensemble_weights": {k: round(v, 4) for k, v in ensemble_weights.items()},
                 "per_class_ensemble": per_class_summary,
+                "n_features": len(feature_columns),
             }
         except Exception as e:
             logger.error("Training error: %s", str(e), exc_info=True)
