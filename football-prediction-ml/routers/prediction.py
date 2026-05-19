@@ -4,7 +4,7 @@ Router for match prediction endpoints.
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from typing import Dict
+from typing import Dict, List
 import os
 import logging
 import pandas as pd
@@ -22,8 +22,8 @@ router = APIRouter(prefix="/predict", tags=["Predictions"])
 # ──────────────────────────────────────────────
 
 class PredictionRequest(BaseModel):
-    home_team: str = Field(..., description="Echipa de acasă")
-    away_team: str = Field(..., description="Echipa din deplasare")
+    home_team: str = Field(..., description="Home team")
+    away_team: str = Field(..., description="Away team")
 
     class Config:
         json_schema_extra = {
@@ -34,10 +34,24 @@ class PredictionRequest(BaseModel):
         }
 
 
+class ReasoningFactor(BaseModel):
+    id: str = Field(..., description="Short factor identifier (elo, form_last5, h2h, ...)")
+    label: str = Field(..., description="Human-readable label for the factor")
+    home_value: float = Field(..., description="Factor value for the home team")
+    away_value: float = Field(..., description="Factor value for the away team")
+    favors: str = Field(..., description="Which side this factor favors: 'home', 'away', or 'none'")
+    description: str = Field(..., description="Short description of the factor")
+
+
+class PredictionReasoning(BaseModel):
+    summary: str = Field(..., description="Narrative explanation of the model's pick")
+    factors: List[ReasoningFactor] = Field(..., description="Structured factors for the UI to render")
+
+
 class PredictionResponse(BaseModel):
     match: str
     prediction: str
-    confidence: float = Field(..., description="Procentajul de încredere (0-100)")
+    confidence: float = Field(..., description="Confidence percentage (0-100)")
     home_team: str
     away_team: str
     home_elo: float
@@ -47,6 +61,7 @@ class PredictionResponse(BaseModel):
     home_win_prob: float
     draw_prob: float
     away_win_prob: float
+    reasoning: PredictionReasoning
 
 
 # ──────────────────────────────────────────────
@@ -538,7 +553,241 @@ def build_feature_vector(home_team, away_team, matches_df, elo_df, feature_colum
         logger.warning("Unmatched feature columns (zero-filled): %s", unmatched[:10])
         print(f"Unmatched feature columns (zero-filled): {unmatched[:10]}")
 
-    return np.array([features]), home_elo, away_elo
+    context = {
+        'home_elo': home_elo,
+        'away_elo': away_elo,
+        'home_stats': home_stats,
+        'away_stats': away_stats,
+        'home_side_form': home_side_form,
+        'away_side_form': away_side_form,
+        'h2h': h2h,
+    }
+    return np.array([features]), home_elo, away_elo, context
+
+
+# ──────────────────────────────────────────────
+# 🗣️  REASONING (fan-friendly explanations)
+# ──────────────────────────────────────────────
+
+def _join_list(items):
+    """Join strings as readable English: 'a, b and c'."""
+    items = list(items)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _factor_phrase_for_winner(factor, target_side):
+    """Short phrase used inside the summary to describe a factor supporting the winner."""
+    fid = factor['id']
+    is_home = target_side == 'home'
+    winner_val = factor['home_value'] if is_home else factor['away_value']
+    loser_val = factor['away_value'] if is_home else factor['home_value']
+    if fid == 'elo':
+        return f"a better Elo rating ({winner_val:.0f} vs {loser_val:.0f})"
+    if fid == 'form_last5':
+        return f"stronger recent form ({winner_val:.2f} vs {loser_val:.2f} pts/match over the last 5)"
+    if fid == 'side_form':
+        where = "at home" if is_home else "on the road"
+        return f"a stronger record {where} ({winner_val:.2f} pts/match)"
+    if fid == 'h2h':
+        return f"a favorable head-to-head record ({int(winner_val)}-{int(loser_val)})"
+    if fid == 'goal_diff_last5':
+        return f"a better recent goal difference ({winner_val:+.2f} vs {loser_val:+.2f} goals/match)"
+    if fid == 'win_streak':
+        return f"a {int(winner_val)}-match win streak"
+    return factor['label'].lower()
+
+
+def _opposing_caveat(factor, opp_team):
+    """One-sentence caveat acknowledging the strongest signal against the predicted winner."""
+    fid = factor['id']
+    if fid == 'elo':
+        return f"That said, {opp_team} has a higher Elo rating."
+    if fid == 'form_last5':
+        return f"However, {opp_team} comes in with better form over the last 5 matches."
+    if fid == 'side_form':
+        return f"That said, {opp_team} has a stronger record on its own turf."
+    if fid == 'h2h':
+        return f"However, the head-to-head history favors {opp_team}."
+    if fid == 'goal_diff_last5':
+        return f"That said, {opp_team} has a better recent goal difference."
+    if fid == 'win_streak':
+        return f"That said, {opp_team} is on a win streak of its own."
+    return ""
+
+
+def build_reasoning(prediction, home_team, away_team, context):
+    """Build a human-readable explanation (Romanian) of why the model picked this outcome.
+
+    Returns a dict with `summary` (string) and `factors` (list of structured items the UI can
+    render as a table/bar chart). This is a *narrative consistent with* the prediction — it
+    surfaces the fan-relevant signals (Elo, recent form, H2H, side form, goal diff, streak)
+    and says which side each favors. It is NOT a decomposition of the meta-learner's output.
+    """
+    home_elo = context['home_elo']
+    away_elo = context['away_elo']
+    home_stats = context['home_stats']
+    away_stats = context['away_stats']
+    home_side_form = context['home_side_form']
+    away_side_form = context['away_side_form']
+    h2h = context['h2h']
+
+    factors = []
+
+    # 1. Elo
+    elo_diff = home_elo - away_elo
+    elo_favors = 'home' if elo_diff > 25 else ('away' if elo_diff < -25 else 'none')
+    elo_desc = f"{home_team} Elo: {home_elo:.0f}, {away_team} Elo: {away_elo:.0f}."
+    if elo_favors != 'none':
+        winner_name = home_team if elo_favors == 'home' else away_team
+        elo_desc += f" {winner_name} leads by {abs(elo_diff):.0f} points."
+    else:
+        elo_desc += " Negligible difference."
+    factors.append({
+        'id': 'elo', 'label': 'Elo rating',
+        'home_value': round(home_elo, 0), 'away_value': round(away_elo, 0),
+        'favors': elo_favors, 'strength': abs(elo_diff) / 200.0,
+        'description': elo_desc,
+    })
+
+    # 2. Form — points/match over last 5
+    h_pts5 = home_stats['Last5'].get('Points', 0)
+    a_pts5 = away_stats['Last5'].get('Points', 0)
+    pts_diff = h_pts5 - a_pts5
+    form_favors = 'home' if pts_diff > 0.3 else ('away' if pts_diff < -0.3 else 'none')
+    form_desc = (
+        f"{home_team} averaged {h_pts5:.2f} pts/match, "
+        f"{away_team} {a_pts5:.2f} pts/match over the last 5."
+    )
+    factors.append({
+        'id': 'form_last5', 'label': 'Form (last 5 matches)',
+        'home_value': round(h_pts5, 2), 'away_value': round(a_pts5, 2),
+        'favors': form_favors, 'strength': abs(pts_diff),
+        'description': form_desc,
+    })
+
+    # 3. Side form — home at home vs away on the road
+    h_home_pts = home_side_form['Last5'].get('Points', 0)
+    a_away_pts = away_side_form['Last5'].get('Points', 0)
+    side_diff = h_home_pts - a_away_pts
+    side_favors = 'home' if side_diff > 0.3 else ('away' if side_diff < -0.3 else 'none')
+    side_desc = (
+        f"{home_team} at home: {h_home_pts:.2f} pts/match. "
+        f"{away_team} away: {a_away_pts:.2f} pts/match."
+    )
+    factors.append({
+        'id': 'side_form', 'label': 'Home / away record',
+        'home_value': round(h_home_pts, 2), 'away_value': round(a_away_pts, 2),
+        'favors': side_favors, 'strength': abs(side_diff) * 0.8,
+        'description': side_desc,
+    })
+
+    # 4. H2H (skip if too few meetings)
+    n_h2h = int(h2h.get('H2H_TotalMatches', 0))
+    if n_h2h >= 3:
+        rate = h2h['H2H_HomeWinRate']
+        draw_rate = h2h['H2H_DrawRate']
+        home_w = int(round(rate * n_h2h))
+        draws = int(round(draw_rate * n_h2h))
+        away_w = max(0, n_h2h - home_w - draws)
+        if home_w >= away_w + 2:
+            h2h_favors = 'home'
+        elif away_w >= home_w + 2:
+            h2h_favors = 'away'
+        else:
+            h2h_favors = 'none'
+        factors.append({
+            'id': 'h2h', 'label': 'Head-to-head',
+            'home_value': float(home_w), 'away_value': float(away_w),
+            'favors': h2h_favors, 'strength': abs(home_w - away_w) / max(n_h2h, 1) * 1.2,
+            'description': (
+                f"Over {n_h2h} head-to-head matches: {home_w} wins for {home_team}, "
+                f"{draws} draws, {away_w} wins for {away_team}."
+            ),
+        })
+
+    # 5. Goal difference last 5
+    h_gd5 = home_stats['Last5'].get('GoalDiff', 0)
+    a_gd5 = away_stats['Last5'].get('GoalDiff', 0)
+    gd_diff = h_gd5 - a_gd5
+    gd_favors = 'home' if gd_diff > 0.3 else ('away' if gd_diff < -0.3 else 'none')
+    factors.append({
+        'id': 'goal_diff_last5', 'label': 'Goal difference (last 5)',
+        'home_value': round(h_gd5, 2), 'away_value': round(a_gd5, 2),
+        'favors': gd_favors, 'strength': abs(gd_diff) * 0.6,
+        'description': (
+            f"{home_team}: {h_gd5:+.2f} goals/match, "
+            f"{away_team}: {a_gd5:+.2f} goals/match."
+        ),
+    })
+
+    # 6. Win streak — only emit if at least one team is on a real run
+    h_streak = int(home_stats.get('WinStreak', 0))
+    a_streak = int(away_stats.get('WinStreak', 0))
+    if max(h_streak, a_streak) >= 3:
+        if h_streak - a_streak >= 2:
+            streak_favors = 'home'
+        elif a_streak - h_streak >= 2:
+            streak_favors = 'away'
+        else:
+            streak_favors = 'none'
+        factors.append({
+            'id': 'win_streak', 'label': 'Win streak',
+            'home_value': float(h_streak), 'away_value': float(a_streak),
+            'favors': streak_favors, 'strength': abs(h_streak - a_streak) * 0.5,
+            'description': (
+                f"{home_team}: {h_streak} consecutive wins. "
+                f"{away_team}: {a_streak} consecutive wins."
+            ),
+        })
+
+    # ── English summary ──
+    pred = int(prediction)
+    if pred == 0:
+        summary = (
+            "The model expects an evenly matched game. The key signals "
+            "(Elo, recent form, head-to-head) do not clearly favor either side."
+        )
+    else:
+        target_side = 'home' if pred == 1 else 'away'
+        winner = home_team if pred == 1 else away_team
+        location = "at home" if pred == 1 else "on the road"
+
+        supporting = sorted(
+            (f for f in factors if f['favors'] == target_side),
+            key=lambda f: -f['strength'],
+        )
+        opposing = sorted(
+            (f for f in factors if f['favors'] not in (target_side, 'none')),
+            key=lambda f: -f['strength'],
+        )
+
+        if supporting:
+            phrases = [_factor_phrase_for_winner(f, target_side) for f in supporting[:3]]
+            summary = f"{winner} is favored {location} thanks to {_join_list(phrases)}."
+        else:
+            summary = (
+                f"The model picks {winner} {location} without a single dominant fundamental signal — "
+                f"the call rests on the finer combination of indicators."
+            )
+
+        if opposing:
+            opp = opposing[0]
+            opp_team = home_team if opp['favors'] == 'home' else away_team
+            caveat = _opposing_caveat(opp, opp_team)
+            if caveat:
+                summary += " " + caveat
+
+    return {
+        'summary': summary,
+        'factors': [
+            {k: v for k, v in f.items() if k != 'strength'}
+            for f in factors
+        ],
+    }
 
 
 # ──────────────────────────────────────────────
@@ -548,7 +797,7 @@ def build_feature_vector(home_team, away_team, matches_df, elo_df, feature_colum
 @router.post("/", response_model=PredictionResponse)
 async def predict_match(request: PredictionRequest):
     """
-    Face o predicție pentru un meci de fotbal.
+    Predict the outcome of a football match.
     """
     try:
         logger.info("Prediction request: %s vs %s", request.home_team, request.away_team)
@@ -560,7 +809,7 @@ async def predict_match(request: PredictionRequest):
             print("Models not loaded - returning 503")
             raise HTTPException(
                 status_code=503,
-                detail="Modelele nu sunt încărcate! Rulează /train mai întâi."
+                detail="Models are not loaded! Run /train first."
             )
 
         logger.info("Loading dataset from Kaggle...")
@@ -590,7 +839,7 @@ async def predict_match(request: PredictionRequest):
         logger.info("Building feature vector...")
         print("Building feature vector...")
         elo_baseline = load_elo_baseline()
-        features, home_elo, away_elo = build_feature_vector(
+        features, home_elo, away_elo, context = build_feature_vector(
             request.home_team, request.away_team, matches_df, elo_df, feature_columns,
             elo_baseline=elo_baseline,
         )
@@ -633,14 +882,16 @@ async def predict_match(request: PredictionRequest):
             prob_dict[str(int(label))] = ensemble_proba[i] * 100
 
         result_map = {
-            1.0:  "🏠 Câștigă ACASĂ",
-            0.0:  "🤝 EGAL",
-            -1.0: "🚗 Câștigă DEPLASARE"
+            1.0:  "🏠 HOME win",
+            0.0:  "🤝 DRAW",
+            -1.0: "🚗 AWAY win"
         }
 
         home_win_prob = prob_dict.get("1", 0)
         draw_prob = prob_dict.get("0", 0)
         away_win_prob = prob_dict.get("-1", 0)
+
+        reasoning = build_reasoning(prediction, request.home_team, request.away_team, context)
 
         logger.info("Prediction result: %s -> %s (confidence: %.1f%%)",
                     f"{request.home_team} vs {request.away_team}",
@@ -660,7 +911,8 @@ async def predict_match(request: PredictionRequest):
             "probabilities": prob_dict,
             "home_win_prob": round(home_win_prob, 2),
             "draw_prob": round(draw_prob, 2),
-            "away_win_prob": round(away_win_prob, 2)
+            "away_win_prob": round(away_win_prob, 2),
+            "reasoning": reasoning,
         }
 
     except HTTPException:
@@ -670,5 +922,5 @@ async def predict_match(request: PredictionRequest):
         print(f"Prediction error: {str(e)}")
         raise HTTPException(
             status_code=400,
-            detail=f"Eroare la predicție: {str(e)}"
+            detail=f"Prediction error: {str(e)}"
         )
