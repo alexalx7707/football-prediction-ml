@@ -150,21 +150,24 @@ async def data_stats():
 @router.get("/teams", response_model=TeamsResponse)
 async def get_teams():
     """
-    Returns the sorted list of distinct team names available for predictions —
-    intended for populating a dropdown in the frontend.
+    Returns the sorted list of team names that can actually be predicted — i.e. teams that
+    have a usable Elo rating — intended for populating a dropdown in the frontend.
 
-    The names match exactly what POST /predict/ expects, because both ultimately come
-    from the Kaggle Matches.csv. Reads from MongoDB first (fast; populated by
-    POST /data/import), and falls back to downloading the Kaggle dataset if MongoDB
-    holds no matches, so the dropdown stays usable even before an import.
+    Teams without any Elo are deliberately excluded. Prediction needs a non-NaN Elo, and a
+    team like FCSB (absent from EloRatings, blank Elo in Matches.csv) would otherwise produce
+    a degraded, Elo-less prediction. A team is considered predictable when it has at least one
+    match row carrying a non-blank Elo — exactly the condition under which the predictor
+    resolves a real rating. Reads MongoDB first (populated by POST /data/import), falling back
+    to the Kaggle dataset if MongoDB is empty, so the dropdown stays usable even before import.
     """
     teams = set()
 
-    # 1) Prefer MongoDB — fast and consistent with the rest of /data/*
+    # 1) Prefer MongoDB — teams with at least one non-null Elo (home or away appearance).
+    #    Imported rows store blank Elo as null (see _clean_record), so $ne: None filters them.
     try:
         db = get_db()
-        for col in ("HomeTeam", "AwayTeam"):
-            teams.update(db.matches.distinct(col))
+        teams.update(db.matches.distinct("HomeTeam", {"HomeElo": {"$ne": None}}))
+        teams.update(db.matches.distinct("AwayTeam", {"AwayElo": {"$ne": None}}))
     except Exception as e:
         logger.warning("Could not read teams from MongoDB: %s", str(e))
         print(f"Could not read teams from MongoDB: {str(e)}")
@@ -176,10 +179,11 @@ async def get_teams():
         try:
             path = kagglehub.dataset_download("adamgbor/club-football-match-data-2000-2025")
             matches_df = pd.read_csv(
-                os.path.join(path, "Matches.csv"), usecols=["HomeTeam", "AwayTeam"]
+                os.path.join(path, "Matches.csv"),
+                usecols=["HomeTeam", "AwayTeam", "HomeElo", "AwayElo"],
             )
-            teams.update(matches_df["HomeTeam"].dropna().tolist())
-            teams.update(matches_df["AwayTeam"].dropna().tolist())
+            teams.update(matches_df.loc[matches_df["HomeElo"].notna(), "HomeTeam"].tolist())
+            teams.update(matches_df.loc[matches_df["AwayElo"].notna(), "AwayTeam"].tolist())
         except Exception as e:
             logger.error("Failed to load teams from Kaggle: %s", str(e))
             print(f"Failed to load teams from Kaggle: {str(e)}")
@@ -190,8 +194,8 @@ async def get_teams():
         str(t).strip() for t in teams
         if t is not None and not (isinstance(t, float) and math.isnan(t)) and str(t).strip()
     })
-    logger.info("Returning %d teams", len(cleaned))
-    print(f"Returning {len(cleaned)} teams")
+    logger.info("Returning %d teams (with Elo)", len(cleaned))
+    print(f"Returning {len(cleaned)} teams (with Elo)")
     return TeamsResponse(teams=cleaned)
 
 

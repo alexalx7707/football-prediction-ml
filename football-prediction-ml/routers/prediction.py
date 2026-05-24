@@ -99,18 +99,34 @@ def load_elo_baseline():
     return 1500.0
 
 
-def get_team_elo(team_name, elo_df=None, matches_df=None, is_home=True):
-    if elo_df is not None:
-        team_elo = elo_df[elo_df['club'] == team_name].sort_values('date')
-        if len(team_elo) > 0:
-            return float(team_elo['elo'].iloc[-1])
+def get_team_elo(team_name, elo_df=None, matches_df=None, is_home=True, fallback=1500.0):
+    """Most recent known Elo for a team. Never returns NaN.
+
+    Elo is team-level (not side-specific), so we take the latest non-NaN value from the
+    dedicated Elo table first, then from the team's match rows (home or away appearances).
+    Falls back to `fallback` when no rating exists — e.g. FCSB is absent from EloRatings and
+    has blank Elo in Matches.csv. Returning a real number here keeps the feature vector
+    NaN-free, which matters because RandomForest/LogisticRegression reject NaN at predict time.
+    """
+    # 1) Dedicated Elo table — latest non-NaN rating for this club
+    if elo_df is not None and 'club' in elo_df.columns:
+        vals = elo_df[elo_df['club'] == team_name].sort_values('date')['elo'].dropna()
+        if len(vals) > 0:
+            return float(vals.iloc[-1])
+    # 2) Elo recorded on the team's matches — newest non-NaN across home & away appearances
     if matches_df is not None:
-        col = 'HomeTeam' if is_home else 'AwayTeam'
-        elo_col = 'HomeElo' if is_home else 'AwayElo'
-        team_matches = matches_df[matches_df[col] == team_name].sort_values('MatchDate')
-        if len(team_matches) > 0:
-            return float(team_matches[elo_col].iloc[-1])
-    return 1500.0
+        parts = []
+        if {'HomeTeam', 'HomeElo'}.issubset(matches_df.columns):
+            h = matches_df.loc[matches_df['HomeTeam'] == team_name, ['MatchDate', 'HomeElo']]
+            parts.append(h.rename(columns={'HomeElo': 'Elo'}))
+        if {'AwayTeam', 'AwayElo'}.issubset(matches_df.columns):
+            a = matches_df.loc[matches_df['AwayTeam'] == team_name, ['MatchDate', 'AwayElo']]
+            parts.append(a.rename(columns={'AwayElo': 'Elo'}))
+        if parts:
+            allm = pd.concat(parts, ignore_index=True).dropna(subset=['Elo'])
+            if len(allm) > 0:
+                return float(allm.sort_values('MatchDate')['Elo'].iloc[-1])
+    return float(fallback)
 
 
 ROLLING_STATS = [
@@ -362,8 +378,8 @@ def _resolve_division(home_team, matches_df, latest_match):
 
 
 def build_feature_vector(home_team, away_team, matches_df, elo_df, feature_columns, elo_baseline=1500.0):
-    home_elo = get_team_elo(home_team, elo_df, matches_df, is_home=True)
-    away_elo = get_team_elo(away_team, elo_df, matches_df, is_home=False)
+    home_elo = get_team_elo(home_team, elo_df, matches_df, is_home=True, fallback=elo_baseline)
+    away_elo = get_team_elo(away_team, elo_df, matches_df, is_home=False, fallback=elo_baseline)
     prediction_date = pd.Timestamp.now()
     home_stats = get_team_recent_stats(home_team, matches_df, prediction_date, elo_baseline=elo_baseline)
     away_stats = get_team_recent_stats(away_team, matches_df, prediction_date, elo_baseline=elo_baseline)
@@ -562,7 +578,17 @@ def build_feature_vector(home_team, away_team, matches_df, elo_df, feature_colum
         'away_side_form': away_side_form,
         'h2h': h2h,
     }
-    return np.array([features]), home_elo, away_elo, context
+
+    # Defensive: a single NaN/inf anywhere makes RF/LR reject the whole row at predict time.
+    # Zero-fill stragglers (and log which) so a sparse team degrades instead of erroring.
+    arr = np.array([features], dtype=float)
+    if not np.all(np.isfinite(arr)):
+        bad = [feature_columns[i] for i in np.where(~np.isfinite(arr[0]))[0]]
+        logger.warning("Non-finite feature values zero-filled: %s", bad[:10])
+        print(f"Non-finite feature values zero-filled: {bad[:10]}")
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return arr, home_elo, away_elo, context
 
 
 # ──────────────────────────────────────────────
